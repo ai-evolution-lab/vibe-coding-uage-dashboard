@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { CloudDownload, Search, Trash2 } from 'lucide-react'
 import type { PriceRule, PricingCatalog } from '../types'
 import { formatDateTime, formatNumber } from '../lib/format'
-import { resolvePrice } from '../lib/pricing'
+import { resolvePrice, searchCatalog } from '../lib/pricing'
 import type { MatchKind, PricingIndex } from '../lib/pricing'
 
 interface PricingPanelProps {
@@ -55,11 +55,7 @@ export function PricingPanel({
     () => usedModels.map((model) => ({ model, resolved: resolvePrice(model, pricing) })),
     [pricing, usedModels],
   )
-  const searchRows = useMemo(() => {
-    const term = query.trim().toLowerCase()
-    if (term.length < 2) return []
-    return catalog.rules.filter((rule) => rule.model.includes(term)).slice(0, 20)
-  }, [catalog.rules, query])
+  const searchRows = useMemo(() => searchCatalog(catalog, query), [catalog, query])
 
   function upsertOverride(model: string, base: PriceRule | undefined) {
     const existing = catalog.overrides.find((rule) => rule.model === model)
@@ -207,10 +203,13 @@ export function PricingPanel({
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="在完整价格库里搜索模型，例如 gpt-6 / opus"
+            placeholder="在完整价格库里搜索，例如 opus 5.5 / gpt 5.6 sol（不区分大小写、空格和点）"
             className="w-full bg-transparent outline-none placeholder:text-slate-600"
           />
         </label>
+        {query.trim().length >= 2 && searchRows.length === 0 ? (
+          <p className="mt-2 text-xs text-slate-500">价格库里没有匹配的模型。新模型发布后点“一键更新价格”再搜。</p>
+        ) : null}
         {searchRows.length ? (
           <div className="mt-2 overflow-x-auto">
             <table className="min-w-full text-left text-sm tabular-nums">

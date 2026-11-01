@@ -1,9 +1,9 @@
 import { useMemo } from 'react'
-import type { DailyBucket } from '../types'
+import type { DailyActivity } from '../types'
 import { formatCompact, formatCurrency } from '../lib/format'
 
 interface ActivityHeatmapProps {
-  daily: DailyBucket[]
+  daily: DailyActivity[]
   weeks?: number
 }
 
@@ -23,7 +23,7 @@ export function ActivityHeatmap({ daily, weeks = 53 }: ActivityHeatmapProps) {
     const end = new Date(today.getFullYear(), today.getMonth(), today.getDate())
     const start = new Date(end)
     start.setDate(start.getDate() - (weeks * 7 - 1) - end.getDay())
-    const cells: Array<{ key: string; item?: DailyBucket; future: boolean }> = []
+    const cells: Array<{ key: string; item?: DailyActivity; future: boolean }> = []
     for (const cursor = new Date(start); cursor <= end || cursor.getDay() !== 0; cursor.setDate(cursor.getDate() + 1)) {
       const key = dayKey(cursor)
       cells.push({ key, item: byDay.get(key), future: cursor > end })
@@ -66,7 +66,7 @@ export function ActivityHeatmap({ daily, weeks = 53 }: ActivityHeatmapProps) {
                   title={
                     cell.future
                       ? ''
-                      : `${cell.key}：${formatCompact(cell.item?.totalTokens ?? 0, 2)} tokens · ${formatCurrency(cell.item?.estimatedCost ?? 0)}`
+                      : `${cell.key}：${formatCompact(cell.item?.totalTokens ?? 0, 2)} tokens · ${formatCurrency(cell.item?.estimatedCost ?? 0)} · ${cell.item?.sessions ?? 0} 个会话`
                   }
                 />
               ))}

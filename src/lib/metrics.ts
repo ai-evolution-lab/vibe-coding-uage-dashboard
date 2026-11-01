@@ -1,5 +1,6 @@
 import type {
   CostBreakdown,
+  DailyActivity,
   DashboardData,
   DistributionBucket,
   FilterState,
@@ -64,6 +65,9 @@ function startOfMonth(date: Date) {
 }
 
 function bucketDate(date: Date, granularity: TimeGranularity) {
+  if (granularity === 'hour') {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours())
+  }
   if (granularity === 'week') {
     return startOfWeek(date)
   }
@@ -80,7 +84,26 @@ function formatBucket(date: Date, granularity: TimeGranularity) {
   if (granularity === 'month') {
     return `${year}-${month}`
   }
+  if (granularity === 'hour') {
+    return `${year}-${month}-${day} ${String(date.getHours()).padStart(2, '0')}:00`
+  }
   return `${year}-${month}-${day}`
+}
+
+function nextBucket(date: Date, granularity: TimeGranularity) {
+  const next = new Date(date)
+  if (granularity === 'hour') next.setHours(next.getHours() + 1)
+  else if (granularity === 'day') next.setDate(next.getDate() + 1)
+  else if (granularity === 'week') next.setDate(next.getDate() + 7)
+  else next.setMonth(next.getMonth() + 1)
+  return next
+}
+
+function bucketLabel(bucket: string, granularity: TimeGranularity) {
+  if (granularity === 'hour') return bucket.slice(5)
+  if (granularity === 'week') return `${bucket.slice(5)} 周`
+  if (granularity === 'month') return bucket
+  return bucket.slice(5)
 }
 
 function getTimeRangeBounds(filters: FilterState) {
@@ -321,9 +344,11 @@ function buildTrend(
     return current
   }
 
+  let firstTimestamp = Number.POSITIVE_INFINITY
   for (const session of sessions) {
     const seenBuckets = new Set<string>()
     const addToBucket = (timestampMs: number, usage: TokenUsage, contextTokens: number, model: string) => {
+      firstTimestamp = Math.min(firstTimestamp, timestampMs)
       const bucketTime = bucketDate(new Date(timestampMs), granularity)
       const bucket = formatBucket(bucketTime, granularity)
       const current = ensureTrendPoint(bucket)
@@ -357,7 +382,26 @@ function buildTrend(
     }
   }
 
-  return [...trendMap.values()].sort((left, right) => left.bucket.localeCompare(right.bucket))
+  // 补齐没有用量的时间段，让 x 轴连续；范围从第一个有数据的桶到筛选范围终点（最多到当前时间）。
+  const filled = [...trendMap.values()].sort((left, right) => left.bucket.localeCompare(right.bucket))
+  if (filled.length === 0) {
+    return filled
+  }
+  const firstSampleTime = Math.max(minTime, firstTimestamp)
+  const endTime = Math.min(Number.isFinite(maxTime) ? maxTime : Date.now(), Date.now())
+  const result: TrendPoint[] = []
+  const limit = 2000
+  for (
+    let cursor = bucketDate(new Date(firstSampleTime), granularity);
+    cursor.getTime() <= endTime && result.length < limit;
+    cursor = nextBucket(cursor, granularity)
+  ) {
+    const key = formatBucket(cursor, granularity)
+    const point = trendMap.get(key) ?? ensureTrendPoint(key)
+    point.bucketLabel = bucketLabel(key, granularity)
+    result.push(point)
+  }
+  return result.length >= limit ? filled : result
 }
 
 function buildRankedValues(
@@ -367,6 +411,9 @@ function buildRankedValues(
 ): RankedValue[] {
   const map = new Map<string, RankedValue>()
   for (const session of sessions) {
+    if (getMetricTotalTokens(session) <= 0) {
+      continue
+    }
     const key = selector(session) || 'unknown'
     const current =
       map.get(key) ??
@@ -544,22 +591,53 @@ function buildPerMinuteStats(sessions: MergedSession[], minTime: number, maxTime
   return {
     avgTpm: totalTokens / activeMinuteCount,
     avgRpm: totalRequests / activeMinuteCount,
-    sparklineTpm: [...minuteTokens.entries()]
-      .sort((left, right) => left[0].localeCompare(right[0]))
-      .slice(-12)
-      .map(([, value]) => value),
   }
 }
 
-/** 热力图用：不受时间筛选影响，按天汇总全部历史（其余筛选条件仍生效）。 */
-export function buildDailyActivity(dataset: DashboardData, filters: FilterState, pricing: PricingIndex) {
+/** 热力图和卡片迷你图用：不受时间筛选影响，按天汇总全部历史（其余筛选条件仍生效）。 */
+export function buildDailyActivity(dataset: DashboardData, filters: FilterState, pricing: PricingIndex): DailyActivity[] {
   const allTime = { ...filters, timeRange: 'all' as const }
   const sessions = filterSessions(dataset.sessions, allTime)
-  return buildTrend(sessions, 'day', pricing, 0, Number.POSITIVE_INFINITY).map((item) => ({
-    day: item.bucket,
-    totalTokens: item.totalTokens,
-    estimatedCost: item.estimatedCost,
-  }))
+  const days = new Map<string, DailyActivity>()
+  const ensure = (day: string) => {
+    const current = days.get(day) ?? { day, totalTokens: 0, estimatedCost: 0, sessions: 0, requests: 0 }
+    days.set(day, current)
+    return current
+  }
+  for (const session of sessions) {
+    const seenDays = new Set<string>()
+    const add = (timestampMs: number, usage: TokenUsage, contextTokens: number, model: string) => {
+      const day = sessionDayKey(timestampMs)
+      const current = ensure(day)
+      current.totalTokens += usage.totalTokens
+      current.estimatedCost += priceSample(usage, contextTokens, model, pricing)
+      current.requests += 1
+      if (!seenDays.has(day)) {
+        current.sessions += 1
+        seenDays.add(day)
+      }
+    }
+    if (session.tokenSamples.length > 0) {
+      for (const sample of session.tokenSamples) {
+        add(sample.timestampMs, usageFromSample(sample), sample.contextTokens ?? 0, sampleModel(session, sample.model))
+      }
+    } else if (session.updatedAtMs > 0) {
+      add(session.updatedAtMs, { ...getMetricUsage(session), totalTokens: getMetricTotalTokens(session) }, 0, session.model)
+    }
+  }
+  return [...days.values()].sort((left, right) => left.day.localeCompare(right.day))
+}
+
+/** 截止今天的连续 N 天（没有用量的日子补 0），供卡片迷你图使用。 */
+export function lastNDays(daily: DailyActivity[], count: number) {
+  const byDay = new Map(daily.map((item) => [item.day, item]))
+  const today = startOfDay(new Date())
+  return Array.from({ length: count }, (_, index) => {
+    const date = new Date(today)
+    date.setDate(date.getDate() - (count - 1 - index))
+    const day = sessionDayKey(date.getTime())
+    return byDay.get(day) ?? { day, totalTokens: 0, estimatedCost: 0, sessions: 0, requests: 0 }
+  })
 }
 
 export function buildMetricSnapshot(
@@ -666,9 +744,5 @@ export function buildMetricSnapshot(
     toolRanks,
     distribution,
     topSessions,
-    sparklineTokens: trend.slice(-12).map((item) => item.totalTokens),
-    sparklineSessions: trend.slice(-12).map((item) => item.sessionCount),
-    sparklineCost: trend.slice(-12).map((item) => item.estimatedCost),
-    sparklineTpm: minuteStats.sparklineTpm,
   }
 }

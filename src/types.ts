@@ -1,4 +1,4 @@
-export type TimeGranularity = 'day' | 'week' | 'month'
+export type TimeGranularity = 'hour' | 'day' | 'week' | 'month'
 
 export type ProviderType = 'codex' | 'claude'
 
@@ -280,10 +280,6 @@ export interface MetricSnapshot {
   toolRanks: ToolRank[]
   distribution: DistributionBucket[]
   topSessions: MergedSession[]
-  sparklineTokens: number[]
-  sparklineSessions: number[]
-  sparklineCost: number[]
-  sparklineTpm: number[]
 }
 
 export interface CostBreakdown {
@@ -293,10 +289,12 @@ export interface CostBreakdown {
   output: number
 }
 
-export interface DailyBucket {
+export interface DailyActivity {
   day: string
   totalTokens: number
   estimatedCost: number
+  sessions: number
+  requests: number
 }
 
 export interface CacheRecord {

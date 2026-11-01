@@ -4,6 +4,9 @@ import type { PriceRule, PriceTier } from '../types'
 
 export const LITELLM_PRICING_URL =
   'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
+/** raw.githubusercontent.com 在部分网络下不可达，jsDelivr 作为备用。 */
+export const LITELLM_PRICING_MIRROR_URL =
+  'https://cdn.jsdelivr.net/gh/BerriAI/litellm@main/model_prices_and_context_window.json'
 export const MODELS_DEV_URL = 'https://models.dev/api.json'
 
 // 同名模型在多个 provider 下都有价格时，按此顺序取官方价，避开云厂商区域加价。
@@ -113,7 +116,8 @@ export function normalizeModelsDev(raw: Record<string, unknown>): PriceRule[] {
     const rank = providerRank(providerId.toLowerCase())
     for (const [modelId, model] of Object.entries(models)) {
       const cost = model?.cost
-      if (typeof cost?.input !== 'number' || typeof cost.output !== 'number') {
+      // 0 价通常是平台内免费额度（如 duo-chat-*），不是模型标价，不收录。
+      if (typeof cost?.input !== 'number' || typeof cost.output !== 'number' || (cost.input === 0 && cost.output === 0)) {
         continue
       }
       const { bare } = splitModelKey(modelId)
@@ -144,12 +148,19 @@ export function normalizeModelsDev(raw: Record<string, unknown>): PriceRule[] {
   return [...best.values()].map((item) => item.rule)
 }
 
-/** primary 优先，secondary 只补充 primary 缺失的模型。 */
+/** 忽略 . 和 - 的差异：gpt-5-6-sol 与 gpt-5.6-sol 视为同一模型。 */
+function looseKey(model: string) {
+  return model.replaceAll('.', '-')
+}
+
+/** primary 优先，secondary 只补充 primary 缺失的模型（名称只差 . / - 也算已有）。 */
 export function mergeRules(primary: PriceRule[], secondary: PriceRule[]) {
   const map = new Map(primary.map((rule) => [rule.model, rule]))
+  const known = new Set(primary.map((rule) => looseKey(rule.model)))
   for (const rule of secondary) {
-    if (!map.has(rule.model)) {
+    if (!map.has(rule.model) && !known.has(looseKey(rule.model))) {
       map.set(rule.model, rule)
+      known.add(looseKey(rule.model))
     }
   }
   return [...map.values()].sort((left, right) => left.model.localeCompare(right.model))

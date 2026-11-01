@@ -1,6 +1,7 @@
 import snapshot from '../data/pricing-snapshot.json'
 import type { CostBreakdown, PriceRule, PricingCatalog, TokenUsage } from '../types'
 import {
+  LITELLM_PRICING_MIRROR_URL,
   LITELLM_PRICING_URL,
   MODELS_DEV_URL,
   mergeRules,
@@ -29,31 +30,76 @@ export function getBuiltinCatalog(): PricingCatalog {
   }
 }
 
-export async function fetchLatestCatalog(overrides: PriceRule[]): Promise<PricingCatalog> {
+async function fetchJsonWithTimeout(url: string, timeoutMs: number) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), cache: 'no-store' })
+  if (!response.ok) {
+    throw new Error(`${new URL(url).host} HTTP ${response.status}`)
+  }
+  return (await response.json()) as Record<string, unknown>
+}
+
+/** 依次尝试多个地址，返回第一个成功的结果。 */
+async function fetchFirst(urls: string[], timeoutMs: number) {
+  const errors: string[] = []
+  for (const url of urls) {
+    try {
+      return await fetchJsonWithTimeout(url, timeoutMs)
+    } catch (error) {
+      errors.push(error instanceof Error ? `${new URL(url).host}: ${error.message}` : String(error))
+    }
+  }
+  throw new Error(errors.join('；'))
+}
+
+export interface CatalogFetchResult {
+  catalog: PricingCatalog
+  warnings: string[]
+}
+
+export async function fetchLatestCatalog(overrides: PriceRule[]): Promise<CatalogFetchResult> {
   const [litellmResult, modelsDevResult] = await Promise.allSettled([
-    fetch(LITELLM_PRICING_URL, { signal: AbortSignal.timeout(30_000) }).then((response) => {
-      if (!response.ok) throw new Error(`LiteLLM HTTP ${response.status}`)
-      return response.json() as Promise<Record<string, unknown>>
-    }),
-    fetch(MODELS_DEV_URL, { signal: AbortSignal.timeout(30_000) }).then((response) => {
-      if (!response.ok) throw new Error(`models.dev HTTP ${response.status}`)
-      return response.json() as Promise<Record<string, unknown>>
-    }),
+    fetchFirst([LITELLM_PRICING_URL, LITELLM_PRICING_MIRROR_URL], 20_000),
+    fetchFirst([MODELS_DEV_URL], 25_000),
   ])
   const litellm = litellmResult.status === 'fulfilled' ? normalizeLiteLLM(litellmResult.value) : []
   const modelsDev = modelsDevResult.status === 'fulfilled' ? normalizeModelsDev(modelsDevResult.value) : []
+  const warnings = [
+    litellmResult.status === 'rejected' ? `LiteLLM 获取失败（${String(litellmResult.reason?.message ?? litellmResult.reason)}）` : '',
+    modelsDevResult.status === 'rejected' ? `models.dev 获取失败（${String(modelsDevResult.reason?.message ?? modelsDevResult.reason)}）` : '',
+  ].filter(Boolean)
   if (litellm.length === 0 && modelsDev.length === 0) {
-    const reason = litellmResult.status === 'rejected' ? String(litellmResult.reason) : '价格源为空'
-    throw new Error(`价格更新失败：${reason}`)
+    throw new Error(`价格更新失败，继续使用当前价格。${warnings.join('；')}`)
   }
   const sources = [litellm.length ? 'LiteLLM' : '', modelsDev.length ? 'models.dev' : ''].filter(Boolean)
   return {
-    version: 2,
-    updatedAtMs: Date.now(),
-    source: sources.join(' + '),
-    rules: mergeRules(litellm, modelsDev),
-    overrides,
+    catalog: {
+      version: 2,
+      updatedAtMs: Date.now(),
+      source: sources.join(' + '),
+      rules: mergeRules(litellm, modelsDev),
+      overrides,
+    },
+    warnings,
   }
+}
+
+/** 搜索用：把 "Opus 5.5" / "claude-opus-5.5" / "gpt 5.6 sol" 统一成可比较的形式。 */
+export function searchKey(value: string) {
+  return value.toLowerCase().replace(/[\s._/-]+/g, '')
+}
+
+export function searchCatalog(catalog: PricingCatalog, query: string, limit = 30) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean).map(searchKey).filter(Boolean)
+  if (terms.length === 0 || terms.join('').length < 2) {
+    return []
+  }
+  return catalog.rules
+    .map((rule) => ({ rule, key: searchKey(rule.model) }))
+    .filter(({ key }) => terms.every((term) => key.includes(term)))
+    // 官方命名（越短、越接近查询）排前面，避免 anthropic--claude-4-opus 这类转售别名挤到顶部。
+    .sort((left, right) => left.key.length - right.key.length || left.rule.model.localeCompare(right.rule.model))
+    .slice(0, limit)
+    .map(({ rule }) => rule)
 }
 
 export type MatchKind = 'custom' | 'exact' | 'normalized' | 'prefix' | 'alias'

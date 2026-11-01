@@ -3,7 +3,7 @@ import type { DBSchema, IDBPDatabase } from 'idb'
 import type { CacheRecord, DashboardData, PricingCatalog, ProviderType } from '../types'
 
 /** 解析规则变化时递增，旧缓存会被丢弃并重新解析。 */
-export const CACHE_SCHEMA_VERSION = 3
+export const CACHE_SCHEMA_VERSION = 4
 
 interface CodexDashboardDB extends DBSchema {
   handles: {
