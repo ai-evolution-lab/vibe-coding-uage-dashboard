@@ -1,19 +1,30 @@
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { closeSync, existsSync, openSync } from 'node:fs'
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
+import readline from 'node:readline/promises'
+import { fileURLToPath } from 'node:url'
 
-const projectRoot = path.resolve(process.argv[1] ? path.dirname(process.argv[1]) : '.', '..')
+const appId = 'vibe-coding-usage-dashboard'
+const scriptPath = fileURLToPath(import.meta.url)
+const projectRoot = path.resolve(path.dirname(scriptPath), '..')
+const runtimeDir = path.join(projectRoot, '.cache', 'launcher')
+const statePath = path.join(runtimeDir, 'server.json')
+const logPath = path.join(runtimeDir, 'server.log')
 const scanCache = new Map()
 const scanCacheTtlMs = 10 * 60 * 1000
 process.chdir(projectRoot)
 
+function log(message) {
+  console.log(`[${appId}] ${message}`)
+}
+
 function fail(message) {
-  console.error(`[vibe-coding-usage-dashboard] ${message}`)
+  console.error(`[${appId}] ${message}`)
   process.exit(1)
 }
 
@@ -150,6 +161,11 @@ function startLocalApiServer(port) {
     try {
       const url = new URL(request.url ?? '/', `http://127.0.0.1:${port}`)
       const provider = url.searchParams.get('provider') === 'claude' ? 'claude' : 'codex'
+
+      if (url.pathname === '/api/health') {
+        sendJson(response, 200, { ok: true, app: appId, pid: process.pid })
+        return
+      }
 
       if (url.pathname === '/api/detect') {
         const result = await inspectProvider(provider)
@@ -321,52 +337,302 @@ async function openBrowser(url) {
   await runCommand('xdg-open', [url])
 }
 
+
 async function ensureDependencies() {
   if (!existsSync(path.join(projectRoot, 'node_modules'))) {
-    console.log('[vibe-coding-usage-dashboard] 首次启动，正在安装依赖...')
+    log('首次启动，正在安装依赖...')
     await runCommand('npm', ['install'])
   }
 }
 
-async function main() {
-  ensureNodeVersion()
-  await ensureDependencies()
+function httpGetJson(url, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const request = http.get(url, { timeout: timeoutMs }, (response) => {
+      let body = ''
+      response.setEncoding('utf8')
+      response.on('data', (chunk) => (body += chunk))
+      response.on('end', () => {
+        try {
+          resolve({ status: response.statusCode, json: JSON.parse(body) })
+        } catch {
+          resolve({ status: response.statusCode, json: null })
+        }
+      })
+    })
+    request.on('timeout', () => request.destroy())
+    request.on('error', () => resolve(null))
+  })
+}
+
+async function waitForHttp(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await httpGetJson(url)
+    if (result && result.status && result.status < 500) {
+      return true
+    }
+    await wait(300)
+  }
+  return false
+}
+
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+async function readState() {
+  try {
+    return JSON.parse(await readFile(statePath, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+// 返回正在运行的后台服务状态；状态文件过期时顺手清理
+async function getRunningState() {
+  const state = await readState()
+  if (!state?.pid) {
+    return null
+  }
+  if (isPidAlive(state.pid)) {
+    const health = await httpGetJson(`http://127.0.0.1:${state.apiPort}/api/health`)
+    if (health?.json?.app === appId && health.json.pid === state.pid) {
+      return state
+    }
+  }
+  await rm(statePath, { force: true })
+  return null
+}
+
+// ---------- 后台服务进程（由 start 以隐藏、脱离终端的方式拉起） ----------
+
+async function serve() {
   const port = await findPort(5180)
   const apiPort = await findPort(6280)
   const url = `http://127.0.0.1:${port}`
 
-  console.log(`[vibe-coding-usage-dashboard] 即将启动: ${url}`)
   await startLocalApiServer(apiPort)
-  console.log(`[vibe-coding-usage-dashboard] 本地只读自动识别服务已启用: http://127.0.0.1:${apiPort}`)
+  log(`本地只读识别服务: http://127.0.0.1:${apiPort}`)
 
-  const child = spawn(
-    'npm',
-    ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
+  const viteBin = path.join(projectRoot, 'node_modules', 'vite', 'bin', 'vite.js')
+  const vite = spawn(
+    process.execPath,
+    [viteBin, '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
     {
       stdio: 'inherit',
-      shell: process.platform === 'win32',
-      env: {
-        ...process.env,
-        VITE_LOCAL_API_PORT: String(apiPort),
-      },
+      windowsHide: true,
+      env: { ...process.env, VITE_LOCAL_API_PORT: String(apiPort) },
     },
   )
 
-  child.on('error', (error) => {
-    fail(`启动失败: ${error.message}`)
-  })
+  let exiting = false
+  const shutdown = async (code) => {
+    if (exiting) return
+    exiting = true
+    if (vite.exitCode === null) {
+      vite.kill()
+    }
+    const state = await readState()
+    if (state?.pid === process.pid) {
+      await rm(statePath, { force: true })
+    }
+    process.exit(code)
+  }
 
-  await wait(2500)
+  vite.on('error', (error) => {
+    console.error(`vite 启动失败: ${error.message}`)
+    shutdown(1)
+  })
+  vite.on('exit', (code) => shutdown(code ?? 0))
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => shutdown(0))
+  }
+
+  if (!(await waitForHttp(url, 60_000))) {
+    console.error('前端页面 60 秒内未就绪')
+    await shutdown(1)
+    return
+  }
+
+  await writeFile(
+    statePath,
+    JSON.stringify({ pid: process.pid, url, port, apiPort, startedAt: new Date().toISOString() }, null, 2),
+  )
+  log(`页面已就绪: ${url}`)
+}
+
+// ---------- 菜单命令 ----------
+
+async function start() {
+  const running = await getRunningState()
+  if (running) {
+    log(`已在后台运行: ${running.url}`)
+    await openBrowserSafe(running.url)
+    return true
+  }
+
+  await ensureDependencies()
+  await mkdir(runtimeDir, { recursive: true })
+  await rm(statePath, { force: true })
+
+  const logFd = openSync(logPath, 'w')
+  const child = spawn(process.execPath, [scriptPath, 'serve'], {
+    cwd: projectRoot,
+    detached: true,
+    windowsHide: true,
+    stdio: ['ignore', logFd, logFd],
+  })
+  closeSync(logFd)
+  child.unref()
+
+  log('正在后台启动...')
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    const state = await readState()
+    if (state?.pid === child.pid) {
+      log(`已在后台启动: ${state.url}`)
+      await openBrowserSafe(state.url)
+      return true
+    }
+    if (!isPidAlive(child.pid)) {
+      break
+    }
+    await wait(400)
+  }
+
+  if (isPidAlive(child.pid)) {
+    await killServer(child.pid)
+  }
+  console.error(`[${appId}] 启动失败，日志: ${logPath}`)
+  return false
+}
+
+async function killServer(pid) {
+  if (process.platform === 'win32') {
+    await new Promise((resolve) => {
+      const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+      killer.on('exit', resolve)
+      killer.on('error', resolve)
+    })
+    return
+  }
+  // detached 启动的服务是进程组组长，向整个进程组发信号，连同 vite 一起结束
+  const killGroup = (signal) => {
+    try {
+      process.kill(-pid, signal)
+    } catch {
+      // 进程已退出
+    }
+  }
+  killGroup('SIGTERM')
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline && isPidAlive(pid)) {
+    await wait(200)
+  }
+  if (isPidAlive(pid)) {
+    killGroup('SIGKILL')
+  }
+}
+
+async function stop() {
+  // 通过健康检查确认 PID 确实是本服务，避免误杀被复用的 PID
+  const state = await getRunningState()
+  if (!state) {
+    log('后台服务未在运行')
+    return true
+  }
+
+  await killServer(state.pid)
+  await rm(statePath, { force: true })
+  log('后台服务已停止')
+  return true
+}
+
+async function restart() {
+  await stop()
+  await wait(500)
+  return start()
+}
+
+async function status() {
+  const running = await getRunningState()
+  if (running) {
+    log(`运行中: ${running.url}（PID ${running.pid}，启动于 ${new Date(running.startedAt).toLocaleString()}）`)
+  } else {
+    log('未运行')
+  }
+  log(`日志: ${logPath}`)
+  return true
+}
+
+async function openBrowserSafe(url) {
   try {
     await openBrowser(url)
   } catch (error) {
-    console.warn(`[vibe-coding-usage-dashboard] 自动打开浏览器失败，请手动访问 ${url}`)
+    console.warn(`[${appId}] 自动打开浏览器失败，请手动访问 ${url}`)
     console.warn(String(error))
   }
+}
 
-  child.on('exit', (code) => {
-    process.exit(code ?? 0)
-  })
+const commands = { start, stop, restart, status }
+
+async function menu() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+  const ask = (prompt) => rl.question(prompt).catch(() => '')
+  const running = await getRunningState()
+  console.log('')
+  console.log('  Vibe Coding Usage Dashboard')
+  console.log(`  当前状态: ${running ? `运行中 ${running.url}` : '未运行'}`)
+  console.log('')
+  console.log('  1. 启动（后台运行并打开浏览器）')
+  console.log('  2. 停止')
+  console.log('  3. 重启')
+  console.log('  4. 查看状态')
+  console.log('  0. 退出')
+  console.log('')
+  const answer = (await ask('  请选择 [1]: ')).trim() || '1'
+  const name = { 1: 'start', 2: 'stop', 3: 'restart', 4: 'status' }[answer]
+  if (!name) {
+    rl.close()
+    return true
+  }
+  console.log('')
+  const ok = await commands[name]()
+  if (name === 'status' || !ok) {
+    await ask('\n按回车键退出...')
+  } else {
+    await wait(1200)
+  }
+  rl.close()
+  return ok
+}
+
+async function main() {
+  ensureNodeVersion()
+  const command = process.argv[2]
+
+  if (command === 'serve') {
+    await serve()
+    return
+  }
+
+  let ok
+  if (commands[command]) {
+    ok = await commands[command]()
+  } else if (!command) {
+    ok = await menu()
+  } else {
+    fail(`未知命令: ${command}，可用: start | stop | restart | status`)
+  }
+  process.exit(ok ? 0 : 1)
 }
 
 main().catch((error) => {

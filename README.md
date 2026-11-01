@@ -40,21 +40,21 @@
 
 ## 快速启动
 
-### Mac
+### Mac / Windows
 
-双击：
+双击 `open.command`（Mac）或 `open.bat`（Windows），在菜单里选择：
 
-```bash
-open.command
+```text
+1. 启动（后台运行并打开浏览器）
+2. 停止
+3. 重启
+4. 查看状态
+0. 退出
 ```
 
-### Windows
+启动后服务在后台运行，关掉终端窗口页面也不会停。要结束服务，再次双击脚本选“停止”。
 
-双击：
-
-```bat
-open.bat
-```
+也可以直接带参数运行：`node scripts/launch.mjs start | stop | restart | status`。后台日志在 `.cache/launcher/server.log`。
 
 ### 命令行启动
 
@@ -63,7 +63,7 @@ npm install
 npm run start:local
 ```
 
-`npm run start:local` 会同时启动前端页面和本地只读识别服务，推荐日常使用。
+`npm run start:local` 会弹出同样的菜单，同时启动前端页面和本地只读识别服务。
 
 如果只想启动前端开发服务器：
 

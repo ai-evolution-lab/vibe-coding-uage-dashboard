@@ -1,4 +1,3 @@
 #!/bin/bash
-set -euo pipefail
 cd "$(dirname "$0")"
-node scripts/launch.mjs
+node scripts/launch.mjs "$@"
