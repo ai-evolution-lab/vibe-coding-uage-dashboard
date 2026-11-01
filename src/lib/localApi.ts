@@ -9,11 +9,13 @@ import type {
   SessionEventSummary,
   VirtualFileEntry,
 } from '../types'
-import { parseClaudeEntries, parseClaudeSessionFile } from './claude'
+import { parseClaudeEntries, parseClaudeSessionFile, sortClaudeEntries } from './claude'
 import {
+  isCodexSessionPath,
   mergeCodexThreadsAndSessions,
   parseCodexEntries,
   parseCodexThreadFile,
+  readCodexSessionText,
   summarizeCodexSessionJsonl,
 } from './codex'
 
@@ -116,9 +118,7 @@ async function loadCodexDataset(
   onProgress?.({ phase: '正在读取 Codex sqlite', processed: 0, total: 1 })
   const stateFile = await fetchLocalFile('codex', stateEntry)
   const threads = await parseCodexThreadFile(stateFile)
-  const sessionEntries = files.filter(
-    (entry) => entry.path.startsWith('sessions/') && entry.path.endsWith('.jsonl'),
-  )
+  const sessionEntries = files.filter((entry) => isCodexSessionPath(entry.path))
   const sessions: SessionEventSummary[] = []
 
   for (const [index, entry] of sessionEntries.entries()) {
@@ -128,7 +128,7 @@ async function loadCodexDataset(
       total: sessionEntries.length,
     })
     const file = await fetchLocalFile('codex', entry)
-    const summary = summarizeCodexSessionJsonl(await file.text(), entry.path)
+    const summary = summarizeCodexSessionJsonl(await readCodexSessionText(file, entry.path), entry.path)
     if (summary) {
       sessions.push(summary)
     }
@@ -161,6 +161,8 @@ async function loadClaudeDataset(
     (entry) => entry.path.startsWith('projects/') && entry.path.endsWith('.jsonl'),
   )
   const sessions: MergedSession[] = []
+  const seenKeys = new Set<string>()
+  sortClaudeEntries(sessionEntries)
 
   for (const [index, entry] of sessionEntries.entries()) {
     onProgress?.({
@@ -169,7 +171,7 @@ async function loadClaudeDataset(
       total: sessionEntries.length,
     })
     const file = await fetchLocalFile('claude', entry)
-    const session = await parseClaudeSessionFile({ path: entry.path, file })
+    const session = await parseClaudeSessionFile({ path: entry.path, file }, seenKeys)
     if (session) {
       sessions.push(session)
     }

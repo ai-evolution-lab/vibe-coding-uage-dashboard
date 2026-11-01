@@ -1,6 +1,6 @@
 import { X } from 'lucide-react'
 import type { MergedSession } from '../types'
-import { formatCompact, formatDateTime, formatDuration, formatNumber } from '../lib/format'
+import { formatCompact, formatCurrency, formatDateTime, formatDuration, formatNumber } from '../lib/format'
 
 interface SessionDetailDrawerProps {
   session: MergedSession | null
@@ -51,9 +51,12 @@ export function SessionDetailDrawer({ session, onClose }: SessionDetailDrawerPro
             <h3 className="text-sm font-semibold text-white">核心指标</h3>
             <div className="mt-3 grid gap-3 sm:grid-cols-2">
               <DetailRow label="总 Tokens" value={formatCompact(session.resolvedTotalTokens, 2)} />
-              <DetailRow label="输入 Tokens" value={formatCompact(session.usage.inputTokens, 2)} />
-              <DetailRow label="输出 Tokens" value={formatCompact(session.usage.outputTokens, 2)} />
-              <DetailRow label="缓存输入 Tokens" value={formatCompact(session.usage.cachedInputTokens, 2)} />
+              <DetailRow label="估算费用" value={session.rangeCost !== undefined ? formatCurrency(session.rangeCost) : '-'} />
+              <DetailRow label="输入（未缓存）" value={formatCompact(session.usage.inputTokens, 2)} />
+              <DetailRow label="缓存读取" value={formatCompact(session.usage.cachedInputTokens, 2)} />
+              <DetailRow label="缓存写入" value={formatCompact(session.usage.cacheWriteTokens ?? 0, 2)} />
+              <DetailRow label="输出（含推理）" value={formatCompact(session.usage.outputTokens, 2)} />
+              <DetailRow label="去重剔除" value={`${formatNumber(session.quality?.duplicateRecords ?? 0)} 条 / ${formatCompact(session.quality?.duplicateTokens ?? 0, 2)}`} />
               <DetailRow label="用户消息" value={formatNumber(session.userMessageCount)} />
               <DetailRow label="助手消息" value={formatNumber(session.assistantMessageCount)} />
               <DetailRow label="交互轮次" value={formatNumber(session.interactionTurns)} />
@@ -74,7 +77,8 @@ export function SessionDetailDrawer({ session, onClose }: SessionDetailDrawerPro
               <DetailRow label="原始事件数" value={formatNumber(session.eventCount)} />
               <DetailRow label="Session 文件" value={session.sessionFilePath || '-'} />
               <DetailRow label="归档状态" value={session.archived ? '已归档' : '未归档'} />
-              <DetailRow label="Token 冲突标记" value={session.usageConflict ? '是' : '否'} />
+              <DetailRow label="子代理" value={session.isSubagent ? '是' : '否'} />
+              <DetailRow label="与 sqlite 总数差异 >5%" value={session.usageConflict ? `是（sqlite ${formatCompact(session.threadTokensUsed, 2)}，含继承的父线程历史）` : '否'} />
             </div>
           </section>
 

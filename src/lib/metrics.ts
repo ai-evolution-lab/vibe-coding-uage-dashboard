@@ -1,17 +1,21 @@
 import type {
+  CostBreakdown,
   DashboardData,
   DistributionBucket,
   FilterState,
   HourBucket,
   MetricSnapshot,
   MergedSession,
-  PriceRule,
   RankedValue,
   TimeGranularity,
+  TokenUsage,
   ToolRank,
   TrendPoint,
   WeekdayBucket,
 } from '../types'
+import { addCost, emptyCost, isTiered, priceUsage, resolvePrice, totalCost } from './pricing'
+import type { PricingIndex } from './pricing'
+import { addQuality, addUsage, createEmptyQuality, createEmptyUsage, usageFromSample } from './usage'
 
 const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 
@@ -141,303 +145,57 @@ function matchesSearch(session: MergedSession, search: string) {
     })
 }
 
-export function getDefaultPriceRules(): PriceRule[] {
-  return [
-    {
-      model: 'gpt-5.5-chat-latest',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 30,
-    },
-    {
-      model: 'gpt-5.5',
-      inputPerMillion: 2.5,
-      cachedInputPerMillion: 0.25,
-      outputPerMillion: 15,
-    },
-    {
-      model: 'gpt-5.5-mini',
-      inputPerMillion: 0.75,
-      cachedInputPerMillion: 0.075,
-      outputPerMillion: 4.5,
-    },
-    {
-      model: 'gpt-5.5-nano',
-      inputPerMillion: 0.2,
-      cachedInputPerMillion: 0.02,
-      outputPerMillion: 1.25,
-    },
-    {
-      model: 'gpt-5.3-codex',
-      inputPerMillion: 1.75,
-      cachedInputPerMillion: 0.175,
-      outputPerMillion: 14,
-    },
-    {
-      model: 'gpt-5.2-chat-latest',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 30,
-    },
-    {
-      model: 'gpt-5.2',
-      inputPerMillion: 2.5,
-      cachedInputPerMillion: 0.25,
-      outputPerMillion: 15,
-    },
-    {
-      model: 'gpt-5.2-mini',
-      inputPerMillion: 0.4,
-      cachedInputPerMillion: 0.04,
-      outputPerMillion: 2,
-    },
-    {
-      model: 'gpt-5.2-nano',
-      inputPerMillion: 0.1,
-      cachedInputPerMillion: 0.01,
-      outputPerMillion: 0.4,
-    },
-    {
-      model: 'gpt-5.1-chat-latest',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 30,
-    },
-    {
-      model: 'gpt-5.1',
-      inputPerMillion: 2,
-      cachedInputPerMillion: 0.2,
-      outputPerMillion: 8,
-    },
-    {
-      model: 'gpt-5.1-mini',
-      inputPerMillion: 0.4,
-      cachedInputPerMillion: 0.04,
-      outputPerMillion: 2,
-    },
-    {
-      model: 'gpt-5.1-nano',
-      inputPerMillion: 0.1,
-      cachedInputPerMillion: 0.01,
-      outputPerMillion: 0.4,
-    },
-    {
-      model: 'chat-latest',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 30,
-    },
-    {
-      model: 'gpt-5-chat-latest',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 30,
-    },
-    {
-      model: 'gpt-5',
-      inputPerMillion: 1.25,
-      cachedInputPerMillion: 0.125,
-      outputPerMillion: 10,
-    },
-    {
-      model: 'gpt-5-mini',
-      inputPerMillion: 0.25,
-      cachedInputPerMillion: 0.025,
-      outputPerMillion: 2,
-    },
-    {
-      model: 'gpt-5-nano',
-      inputPerMillion: 0.05,
-      cachedInputPerMillion: 0.005,
-      outputPerMillion: 0.4,
-    },
-    {
-      model: 'gpt-4.1-mini',
-      inputPerMillion: 0.4,
-      cachedInputPerMillion: 0.1,
-      outputPerMillion: 1.6,
-    },
-    {
-      model: 'gpt-4.1-nano',
-      inputPerMillion: 0.1,
-      cachedInputPerMillion: 0.025,
-      outputPerMillion: 0.4,
-    },
-    {
-      model: 'gpt-4.1',
-      inputPerMillion: 2,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 8,
-    },
-    {
-      model: 'gpt-4o-mini',
-      inputPerMillion: 0.15,
-      cachedInputPerMillion: 0.075,
-      outputPerMillion: 0.6,
-    },
-    {
-      model: 'gpt-4o',
-      inputPerMillion: 2.5,
-      cachedInputPerMillion: 1.25,
-      outputPerMillion: 10,
-    },
-    {
-      model: 'codex-auto-review',
-      inputPerMillion: 1.75,
-      cachedInputPerMillion: 0.175,
-      outputPerMillion: 14,
-    },
-    {
-      model: 'claude-opus-4.8',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4-8',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4.7',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4-7',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4.6',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4-6',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4.5',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4-5',
-      inputPerMillion: 5,
-      cachedInputPerMillion: 0.5,
-      outputPerMillion: 25,
-    },
-    {
-      model: 'claude-opus-4.1',
-      inputPerMillion: 15,
-      cachedInputPerMillion: 1.5,
-      outputPerMillion: 75,
-    },
-    {
-      model: 'claude-opus-4-1',
-      inputPerMillion: 15,
-      cachedInputPerMillion: 1.5,
-      outputPerMillion: 75,
-    },
-    {
-      model: 'claude-opus-4',
-      inputPerMillion: 15,
-      cachedInputPerMillion: 1.5,
-      outputPerMillion: 75,
-    },
-    {
-      model: 'claude-sonnet-4.6',
-      inputPerMillion: 3,
-      cachedInputPerMillion: 0.3,
-      outputPerMillion: 15,
-    },
-    {
-      model: 'claude-sonnet-4-6',
-      inputPerMillion: 3,
-      cachedInputPerMillion: 0.3,
-      outputPerMillion: 15,
-    },
-    {
-      model: 'claude-sonnet-4.5',
-      inputPerMillion: 3,
-      cachedInputPerMillion: 0.3,
-      outputPerMillion: 15,
-    },
-    {
-      model: 'claude-sonnet-4-5',
-      inputPerMillion: 3,
-      cachedInputPerMillion: 0.3,
-      outputPerMillion: 15,
-    },
-    {
-      model: 'claude-sonnet-4',
-      inputPerMillion: 3,
-      cachedInputPerMillion: 0.3,
-      outputPerMillion: 15,
-    },
-    {
-      model: 'claude-haiku-4.5',
-      inputPerMillion: 1,
-      cachedInputPerMillion: 0.1,
-      outputPerMillion: 5,
-    },
-    {
-      model: 'claude-haiku-4-5',
-      inputPerMillion: 1,
-      cachedInputPerMillion: 0.1,
-      outputPerMillion: 5,
-    },
-    {
-      model: 'claude-3-5-haiku',
-      inputPerMillion: 0.8,
-      cachedInputPerMillion: 0.08,
-      outputPerMillion: 4,
-    },
-    {
-      model: 'default',
-      inputPerMillion: 0,
-      cachedInputPerMillion: 0,
-      outputPerMillion: 0,
-    },
-  ]
+interface CostAccumulator {
+  cost: CostBreakdown
+  unpricedTokens: number
+  unpricedModels: Set<string>
+  tieredRequests: number
 }
 
-export function hasExplicitPriceRule(model: string, priceRules: PriceRule[]) {
-  return priceRules.some(
-    (rule) =>
-      rule.model !== 'default' && (rule.model === model || (rule.model && model.startsWith(rule.model))),
-  )
+function createCostAccumulator(): CostAccumulator {
+  return { cost: emptyCost(), unpricedTokens: 0, unpricedModels: new Set(), tieredRequests: 0 }
 }
 
-function findPriceRule(model: string, priceRules: PriceRule[]) {
-  return (
-    priceRules.find((rule) => rule.model === model) ??
-    priceRules.find((rule) => rule.model !== 'default' && model.startsWith(rule.model)) ??
-    priceRules.find((rule) => rule.model === 'default') ??
-    {
-      model: 'default',
-      inputPerMillion: 0,
-      cachedInputPerMillion: 0,
-      outputPerMillion: 0,
+/** 按单次请求计价：每条样本有自己的模型和上下文大小，分档价才能算准。 */
+function priceSample(
+  usage: TokenUsage,
+  contextTokens: number,
+  model: string,
+  pricing: PricingIndex,
+  accumulator?: CostAccumulator,
+) {
+  const resolved = resolvePrice(model, pricing)
+  if (!resolved) {
+    if (accumulator && usage.totalTokens > 0) {
+      accumulator.unpricedTokens += usage.totalTokens
+      accumulator.unpricedModels.add(model || 'unknown')
     }
-  )
+    return 0
+  }
+  const cost = priceUsage(usage, contextTokens, resolved.rule)
+  if (accumulator) {
+    addCost(accumulator.cost, cost)
+    if (isTiered(contextTokens, resolved.rule)) {
+      accumulator.tieredRequests += 1
+    }
+  }
+  return totalCost(cost)
 }
 
-export function estimateSessionCost(session: MergedSession, priceRules: PriceRule[]) {
-  const rule = findPriceRule(session.model, priceRules)
-  return (
-    (session.usage.inputTokens / 1_000_000) * rule.inputPerMillion +
-    (session.usage.cachedInputTokens / 1_000_000) * rule.cachedInputPerMillion +
-    (session.usage.outputTokens / 1_000_000) * rule.outputPerMillion
-  )
+function sampleModel(session: MergedSession, sampleModelName?: string) {
+  return sampleModelName || session.model
+}
+
+export function estimateSessionCost(session: MergedSession, pricing: PricingIndex, accumulator?: CostAccumulator) {
+  if (session.tokenSamples.length > 0) {
+    return session.tokenSamples.reduce(
+      (sum, sample) =>
+        sum + priceSample(usageFromSample(sample), sample.contextTokens ?? 0, sampleModel(session, sample.model), pricing, accumulator),
+      0,
+    )
+  }
+  const usage = getMetricUsage(session)
+  return priceSample(usage, 0, session.model, pricing, accumulator)
 }
 
 export function getFilterDefaults(): FilterState {
@@ -454,6 +212,38 @@ export function getFilterDefaults(): FilterState {
   }
 }
 
+function isInTimeRange(timestampMs: number, minTime: number, maxTime: number) {
+  return timestampMs >= minTime && timestampMs <= maxTime
+}
+
+function getSessionRangeUsage(session: MergedSession, minTime: number, maxTime: number) {
+  if (session.tokenSamples.length > 0) {
+    const usage = createEmptyUsage()
+    let sampleCount = 0
+    for (const sample of session.tokenSamples) {
+      if (!isInTimeRange(sample.timestampMs, minTime, maxTime)) {
+        continue
+      }
+      addUsage(usage, usageFromSample(sample))
+      sampleCount += 1
+    }
+    return sampleCount > 0 ? usage : null
+  }
+
+  if (!isInTimeRange(session.updatedAtMs, minTime, maxTime)) {
+    return null
+  }
+  return { ...session.usage }
+}
+
+function getMetricUsage(session: MergedSession) {
+  return session.rangeUsage ?? session.usage
+}
+
+function getMetricTotalTokens(session: MergedSession) {
+  return session.rangeTotalTokens ?? session.resolvedTotalTokens
+}
+
 export function getAvailableModels(sessions: MergedSession[]) {
   return ['all', ...new Set(sessions.map((session) => session.model).filter(Boolean))].sort()
 }
@@ -466,64 +256,105 @@ export function filterSessions(sessions: MergedSession[], filters: FilterState) 
   const search = normalizeSearchText(filters.search)
   const { minTime, maxTime } = getTimeRangeBounds(filters)
 
-  return sessions.filter((session) => {
+  return sessions.flatMap((session) => {
     if (filters.model !== 'all' && session.model !== filters.model) {
-      return false
+      return []
     }
     if (filters.cwd !== 'all' && session.cwd !== filters.cwd) {
-      return false
+      return []
     }
     if (filters.archived === 'active' && session.archived) {
-      return false
+      return []
     }
     if (filters.archived === 'archived' && !session.archived) {
-      return false
+      return []
     }
-    if (minTime > 0 && session.updatedAtMs < minTime) {
-      return false
+    if (!matchesSearch(session, search)) {
+      return []
     }
-    if (session.updatedAtMs > maxTime) {
-      return false
+
+    const rangeUsage = getSessionRangeUsage(session, minTime, maxTime)
+    if (!rangeUsage) {
+      return []
     }
-    return matchesSearch(session, search)
+    const tokenSamples =
+      session.tokenSamples.length > 0
+        ? session.tokenSamples.filter((sample) => isInTimeRange(sample.timestampMs, minTime, maxTime))
+        : session.tokenSamples
+    return [
+      {
+        ...session,
+        tokenSamples,
+        rangeUsage,
+        rangeTotalTokens: rangeUsage.totalTokens || (session.tokenSamples.length === 0 ? session.resolvedTotalTokens : 0),
+      },
+    ]
   })
 }
 
 function buildTrend(
   sessions: MergedSession[],
   granularity: TimeGranularity,
-  priceRules: PriceRule[],
+  pricing: PricingIndex,
+  minTime: number,
+  maxTime: number,
 ): TrendPoint[] {
   const trendMap = new Map<string, TrendPoint>()
 
-  for (const session of sessions) {
-    const bucketTime = bucketDate(new Date(session.updatedAtMs), granularity)
-    const bucket = formatBucket(bucketTime, granularity)
-    const bucketLabel = bucket
+  function ensureTrendPoint(bucket: string) {
     const current =
       trendMap.get(bucket) ??
       {
         bucket,
-        bucketLabel,
+        bucketLabel: bucket,
         totalTokens: 0,
         inputTokens: 0,
         outputTokens: 0,
         cachedInputTokens: 0,
+        cacheWriteTokens: 0,
         sessionCount: 0,
         toolCallCount: 0,
         estimatedCost: 0,
         byModel: {},
       }
-
-    current.totalTokens += session.resolvedTotalTokens
-    current.inputTokens += session.usage.inputTokens
-    current.outputTokens += session.usage.outputTokens
-    current.cachedInputTokens += session.usage.cachedInputTokens
-    current.sessionCount += 1
-    current.toolCallCount += session.toolCallCount
-    current.estimatedCost += estimateSessionCost(session, priceRules)
-    current.byModel[session.model] = (current.byModel[session.model] ?? 0) + session.resolvedTotalTokens
     trendMap.set(bucket, current)
+    return current
+  }
+
+  for (const session of sessions) {
+    const seenBuckets = new Set<string>()
+    const addToBucket = (timestampMs: number, usage: TokenUsage, contextTokens: number, model: string) => {
+      const bucketTime = bucketDate(new Date(timestampMs), granularity)
+      const bucket = formatBucket(bucketTime, granularity)
+      const current = ensureTrendPoint(bucket)
+      const totalTokens = usage.totalTokens
+      current.totalTokens += totalTokens
+      current.inputTokens += usage.inputTokens
+      current.outputTokens += usage.outputTokens
+      current.cachedInputTokens += usage.cachedInputTokens
+      current.cacheWriteTokens += usage.cacheWriteTokens
+      current.estimatedCost += priceSample(usage, contextTokens, model, pricing)
+      current.byModel[model] = (current.byModel[model] ?? 0) + totalTokens
+      if (!seenBuckets.has(bucket)) {
+        current.sessionCount += 1
+        current.toolCallCount += session.toolCallCount
+        seenBuckets.add(bucket)
+      }
+    }
+
+    if (session.tokenSamples.length > 0) {
+      for (const sample of session.tokenSamples) {
+        if (isInTimeRange(sample.timestampMs, minTime, maxTime)) {
+          addToBucket(sample.timestampMs, usageFromSample(sample), sample.contextTokens ?? 0, sampleModel(session, sample.model))
+        }
+      }
+      continue
+    }
+
+    if (isInTimeRange(session.updatedAtMs, minTime, maxTime)) {
+      const usage = getMetricUsage(session)
+      addToBucket(session.updatedAtMs, { ...usage, totalTokens: getMetricTotalTokens(session) }, 0, session.model)
+    }
   }
 
   return [...trendMap.values()].sort((left, right) => left.bucket.localeCompare(right.bucket))
@@ -532,7 +363,7 @@ function buildTrend(
 function buildRankedValues(
   sessions: MergedSession[],
   selector: (session: MergedSession) => string,
-  priceRules: PriceRule[],
+  costs: Map<string, number>,
 ): RankedValue[] {
   const map = new Map<string, RankedValue>()
   for (const session of sessions) {
@@ -548,8 +379,8 @@ function buildRankedValues(
         avgTokens: 0,
       }
     current.sessions += 1
-    current.totalTokens += session.resolvedTotalTokens
-    current.estimatedCost += estimateSessionCost(session, priceRules)
+    current.totalTokens += getMetricTotalTokens(session)
+    current.estimatedCost += costs.get(session.id) ?? 0
     map.set(key, current)
   }
 
@@ -583,7 +414,15 @@ function sessionDayKey(timestampMs: number) {
 }
 
 export function getAvailableSessionDays(sessions: MergedSession[]) {
-  return [...new Set(sessions.map((session) => sessionDayKey(session.updatedAtMs)))]
+  return [
+    ...new Set(
+      sessions.flatMap((session) =>
+        session.tokenSamples.length > 0
+          ? session.tokenSamples.map((sample) => sessionDayKey(sample.timestampMs))
+          : [sessionDayKey(session.updatedAtMs)],
+      ),
+    ),
+  ]
     .sort((left, right) => right.localeCompare(left))
 }
 
@@ -595,12 +434,26 @@ export function buildHourlyBuckets(sessions: MergedSession[], dateKey?: string):
   }))
 
   for (const session of sessions) {
-    if (dateKey && sessionDayKey(session.updatedAtMs) !== dateKey) {
+    const seenHours = new Set<number>()
+    const addSample = (timestampMs: number, totalTokens: number) => {
+      if (dateKey && sessionDayKey(timestampMs) !== dateKey) {
+        return
+      }
+      const hour = new Date(timestampMs).getHours()
+      hours[hour].totalTokens += totalTokens
+      if (!seenHours.has(hour)) {
+        hours[hour].sessions += 1
+        seenHours.add(hour)
+      }
+    }
+
+    if (session.tokenSamples.length > 0) {
+      for (const sample of session.tokenSamples) {
+        addSample(sample.timestampMs, usageFromSample(sample).totalTokens)
+      }
       continue
     }
-    const hour = new Date(session.updatedAtMs).getHours()
-    hours[hour].totalTokens += session.resolvedTotalTokens
-    hours[hour].sessions += 1
+    addSample(session.updatedAtMs, getMetricTotalTokens(session))
   }
 
   return hours
@@ -614,9 +467,23 @@ function buildWeekdays(sessions: MergedSession[]): WeekdayBucket[] {
   }))
 
   for (const session of sessions) {
-    const weekday = new Date(session.updatedAtMs).getDay()
-    weekdays[weekday].totalTokens += session.resolvedTotalTokens
-    weekdays[weekday].sessions += 1
+    const seenWeekdays = new Set<number>()
+    const addSample = (timestampMs: number, totalTokens: number) => {
+      const weekday = new Date(timestampMs).getDay()
+      weekdays[weekday].totalTokens += totalTokens
+      if (!seenWeekdays.has(weekday)) {
+        weekdays[weekday].sessions += 1
+        seenWeekdays.add(weekday)
+      }
+    }
+
+    if (session.tokenSamples.length > 0) {
+      for (const sample of session.tokenSamples) {
+        addSample(sample.timestampMs, usageFromSample(sample).totalTokens)
+      }
+      continue
+    }
+    addSample(session.updatedAtMs, getMetricTotalTokens(session))
   }
 
   return weekdays
@@ -636,17 +503,20 @@ function buildDistribution(sessions: MergedSession[]): DistributionBucket[] {
     label: bucket.label,
     sessions: sessions.filter(
       (session) =>
-        session.resolvedTotalTokens >= bucket.min && session.resolvedTotalTokens < bucket.max,
+        getMetricTotalTokens(session) >= bucket.min && getMetricTotalTokens(session) < bucket.max,
     ).length,
   }))
 }
 
-function buildPerMinuteStats(sessions: MergedSession[]) {
+function buildPerMinuteStats(sessions: MergedSession[], minTime: number, maxTime: number) {
   const minuteTokens = new Map<string, number>()
   const minuteRequests = new Map<string, number>()
 
   for (const session of sessions) {
     for (const sample of session.tokenSamples) {
+      if (!isInTimeRange(sample.timestampMs, minTime, maxTime)) {
+        continue
+      }
       const bucket = new Date(sample.timestampMs)
       bucket.setSeconds(0, 0)
       const key = bucket.toISOString()
@@ -655,6 +525,9 @@ function buildPerMinuteStats(sessions: MergedSession[]) {
 
     for (const sample of session.requestSamples) {
       if (sample.kind !== 'user') {
+        continue
+      }
+      if (!isInTimeRange(sample.timestampMs, minTime, maxTime)) {
         continue
       }
       const bucket = new Date(sample.timestampMs)
@@ -678,34 +551,48 @@ function buildPerMinuteStats(sessions: MergedSession[]) {
   }
 }
 
+/** 热力图用：不受时间筛选影响，按天汇总全部历史（其余筛选条件仍生效）。 */
+export function buildDailyActivity(dataset: DashboardData, filters: FilterState, pricing: PricingIndex) {
+  const allTime = { ...filters, timeRange: 'all' as const }
+  const sessions = filterSessions(dataset.sessions, allTime)
+  return buildTrend(sessions, 'day', pricing, 0, Number.POSITIVE_INFINITY).map((item) => ({
+    day: item.bucket,
+    totalTokens: item.totalTokens,
+    estimatedCost: item.estimatedCost,
+  }))
+}
+
 export function buildMetricSnapshot(
   dataset: DashboardData,
   filters: FilterState,
-  priceRules: PriceRule[],
+  pricing: PricingIndex,
 ): MetricSnapshot {
-  const filteredSessions = filterSessions(dataset.sessions, filters)
-  const trend = buildTrend(filteredSessions, filters.granularity, priceRules)
-  const modelRanks = buildRankedValues(filteredSessions, (session) => session.model, priceRules)
-  const projectRanks = buildRankedValues(filteredSessions, (session) => session.cwd, priceRules)
+  const { minTime, maxTime } = getTimeRangeBounds(filters)
+  const costAccumulator = createCostAccumulator()
+  const filteredSessions = filterSessions(dataset.sessions, filters).map((session) => ({
+    ...session,
+    rangeCost: estimateSessionCost(session, pricing, costAccumulator),
+  }))
+  const costs = new Map(filteredSessions.map((session) => [session.id, session.rangeCost]))
+  const trend = buildTrend(filteredSessions, filters.granularity, pricing, minTime, maxTime)
+  const modelRanks = buildRankedValues(filteredSessions, (session) => session.model, costs)
+  const projectRanks = buildRankedValues(filteredSessions, (session) => session.cwd, costs)
+  const totalUsage = createEmptyUsage()
+  const quality = createEmptyQuality()
+  for (const session of filteredSessions) {
+    addUsage(totalUsage, getMetricUsage(session))
+    addQuality(quality, session.quality)
+  }
   const toolRanks = buildToolRanks(filteredSessions)
   const hourly = buildHourlyBuckets(filteredSessions)
   const weekdays = buildWeekdays(filteredSessions)
   const distribution = buildDistribution(filteredSessions)
   const topSessions = [...filteredSessions]
-    .sort((left, right) => right.resolvedTotalTokens - left.resolvedTotalTokens)
+    .sort((left, right) => getMetricTotalTokens(right) - getMetricTotalTokens(left))
     .slice(0, 10)
 
-  const totalTokens = filteredSessions.reduce((sum, session) => sum + session.resolvedTotalTokens, 0)
-  const inputTokens = filteredSessions.reduce((sum, session) => sum + session.usage.inputTokens, 0)
-  const cachedInputTokens = filteredSessions.reduce(
-    (sum, session) => sum + session.usage.cachedInputTokens,
-    0,
-  )
-  const outputTokens = filteredSessions.reduce((sum, session) => sum + session.usage.outputTokens, 0)
-  const estimatedCost = filteredSessions.reduce(
-    (sum, session) => sum + estimateSessionCost(session, priceRules),
-    0,
-  )
+  const totalTokens = filteredSessions.reduce((sum, session) => sum + getMetricTotalTokens(session), 0)
+  const estimatedCost = totalCost(costAccumulator.cost)
   const sessionCount = filteredSessions.length
   const interactionTurns = filteredSessions.reduce((sum, session) => sum + session.interactionTurns, 0)
   const userMessages = filteredSessions.reduce((sum, session) => sum + session.userMessageCount, 0)
@@ -715,7 +602,11 @@ export function buildMetricSnapshot(
   )
   const toolCalls = filteredSessions.reduce((sum, session) => sum + session.toolCallCount, 0)
   const activeDays = new Set(
-    filteredSessions.map((session) => formatBucket(startOfDay(new Date(session.updatedAtMs)), 'day')),
+    filteredSessions.flatMap((session) =>
+      session.tokenSamples.length > 0
+        ? session.tokenSamples.map((sample) => formatBucket(startOfDay(new Date(sample.timestampMs)), 'day'))
+        : [formatBucket(startOfDay(new Date(session.updatedAtMs)), 'day')],
+    ),
   ).size
   const avgSessionTokens = sessionCount > 0 ? totalTokens / sessionCount : 0
   const avgSessionDurationMs =
@@ -737,16 +628,23 @@ export function buildMetricSnapshot(
         : current,
     null,
   )
-  const minuteStats = buildPerMinuteStats(filteredSessions)
+  const minuteStats = buildPerMinuteStats(filteredSessions, minTime, maxTime)
 
   return {
     filters,
     filteredSessions,
     totalTokens,
-    inputTokens,
-    cachedInputTokens,
-    outputTokens,
+    inputTokens: totalUsage.inputTokens,
+    cachedInputTokens: totalUsage.cachedInputTokens,
+    cacheWriteTokens: totalUsage.cacheWriteTokens,
+    outputTokens: totalUsage.outputTokens,
+    reasoningOutputTokens: totalUsage.reasoningOutputTokens,
     estimatedCost,
+    costBreakdown: costAccumulator.cost,
+    unpricedTokens: costAccumulator.unpricedTokens,
+    unpricedModels: [...costAccumulator.unpricedModels].sort(),
+    tieredRequests: costAccumulator.tieredRequests,
+    quality,
     sessionCount,
     interactionTurns,
     userMessages,

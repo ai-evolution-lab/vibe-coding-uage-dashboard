@@ -26,10 +26,13 @@ export function exportSessionsCsv(sessions: MergedSession[], provider: ProviderT
     'cwd',
     'createdAt',
     'updatedAt',
-    'resolvedTotalTokens',
+    'rangeTotalTokens',
     'inputTokens',
     'cachedInputTokens',
+    'cacheWriteTokens',
     'outputTokens',
+    'reasoningOutputTokens',
+    'estimatedCost',
     'toolCallCount',
     'userMessageCount',
     'assistantMessageCount',
@@ -39,18 +42,23 @@ export function exportSessionsCsv(sessions: MergedSession[], provider: ProviderT
   ]
   const lines = [
     headers.join(','),
-    ...sessions.map((session) =>
-      [
+    ...sessions.map((session) => {
+      const usage = session.rangeUsage ?? session.usage
+      const totalTokens = session.rangeTotalTokens ?? session.resolvedTotalTokens
+      return [
         session.id,
         session.title,
         session.model,
         session.cwd,
         new Date(session.createdAtMs).toISOString(),
         new Date(session.updatedAtMs).toISOString(),
-        session.resolvedTotalTokens,
-        session.usage.inputTokens,
-        session.usage.cachedInputTokens,
-        session.usage.outputTokens,
+        totalTokens,
+        usage.inputTokens,
+        usage.cachedInputTokens,
+        usage.cacheWriteTokens ?? 0,
+        usage.outputTokens,
+        usage.reasoningOutputTokens,
+        (session.rangeCost ?? 0).toFixed(6),
         session.toolCallCount,
         session.userMessageCount,
         session.assistantMessageCount,
@@ -59,8 +67,8 @@ export function exportSessionsCsv(sessions: MergedSession[], provider: ProviderT
         session.archived,
       ]
         .map(escapeCsv)
-        .join(','),
-    ),
+        .join(',')
+    }),
   ]
 
   downloadBlob(
@@ -74,7 +82,14 @@ export function exportMetricsJson(snapshot: MetricSnapshot, provider: ProviderTy
     exportedAt: new Date().toISOString(),
     summary: {
       totalTokens: snapshot.totalTokens,
+      inputTokens: snapshot.inputTokens,
+      cachedInputTokens: snapshot.cachedInputTokens,
+      cacheWriteTokens: snapshot.cacheWriteTokens,
+      outputTokens: snapshot.outputTokens,
       estimatedCost: snapshot.estimatedCost,
+      costBreakdown: snapshot.costBreakdown,
+      unpricedModels: snapshot.unpricedModels,
+      quality: snapshot.quality,
       sessionCount: snapshot.sessionCount,
       toolCalls: snapshot.toolCalls,
       avgRpm: snapshot.avgRpm,

@@ -7,37 +7,40 @@ import type {
   TokenUsage,
   VirtualFileEntry,
 } from '../types'
-import {
-  createEmptyUsage,
-  createFingerprint,
-  getString,
-  parseEventTimestamp,
-  takeTextFromMessageContent,
-} from './codex'
-
-function asNumber(value: unknown) {
-  return typeof value === 'number' ? value : Number(value ?? 0)
-}
+import { createFingerprint, getString, parseEventTimestamp, takeTextFromMessageContent } from './codex'
+import { addUsage, asNumber, createEmptyQuality, createEmptyUsage, sumUsageParts } from './usage'
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
 }
 
-function addUsage(target: TokenUsage, raw: Record<string, unknown> | null) {
-  if (!raw) {
-    return
+/**
+ * Claude Code 的 usage 字段：input_tokens 只含未缓存输入，cache_read / cache_creation 单独计。
+ * cache_creation.ephemeral_1h_input_tokens 是 1 小时缓存写入，价格高于 5 分钟缓存。
+ */
+export function normalizeClaudeUsage(raw: Record<string, unknown>): TokenUsage {
+  const cacheCreation = asRecord(raw.cache_creation)
+  const usage: TokenUsage = {
+    inputTokens: asNumber(raw.input_tokens),
+    cachedInputTokens: asNumber(raw.cache_read_input_tokens),
+    cacheWriteTokens: asNumber(raw.cache_creation_input_tokens),
+    cacheWrite1hTokens: asNumber(cacheCreation?.ephemeral_1h_input_tokens),
+    outputTokens: asNumber(raw.output_tokens),
+    reasoningOutputTokens: 0,
+    totalTokens: 0,
   }
-  target.inputTokens += asNumber(raw.input_tokens)
-  target.cachedInputTokens +=
-    asNumber(raw.cache_read_input_tokens) + asNumber(raw.cache_creation_input_tokens)
-  target.outputTokens += asNumber(raw.output_tokens)
-  target.reasoningOutputTokens += asNumber(raw.reasoning_output_tokens)
-  target.totalTokens +=
-    asNumber(raw.input_tokens) +
-    asNumber(raw.cache_read_input_tokens) +
-    asNumber(raw.cache_creation_input_tokens) +
-    asNumber(raw.output_tokens) +
-    asNumber(raw.reasoning_output_tokens)
+  usage.totalTokens = sumUsageParts(usage)
+  return usage
+}
+
+/** 同一条回复在流式写入时会产生多行，按 message.id + requestId 去重（与 ccusage 一致）。 */
+export function getClaudeDedupKey(parsed: Record<string, unknown>, message: Record<string, unknown> | null) {
+  const messageId = getString(message?.id)
+  if (!messageId) {
+    return ''
+  }
+  const requestId = getString(parsed.requestId)
+  return requestId ? `${messageId}:${requestId}` : messageId
 }
 
 function getMessageText(message: Record<string, unknown> | null) {
@@ -60,10 +63,24 @@ function makeProjectFromPath(path: string) {
   return ''
 }
 
-export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<MergedSession | null> {
+export async function parseClaudeSessionFile(
+  entry: VirtualFileEntry,
+  seenKeys: Set<string> = new Set(),
+): Promise<MergedSession | null> {
   const text = await entry.file.text()
+  return parseClaudeSessionText(text, entry.path, entry.file.lastModified, seenKeys)
+}
+
+export function parseClaudeSessionText(
+  text: string,
+  entryPath: string,
+  lastModifiedMs: number,
+  seenKeys: Set<string>,
+): MergedSession | null {
   const lines = text.split('\n')
   const usage = createEmptyUsage()
+  const quality = createEmptyQuality()
+  const isSubagent = entryPath.includes('/subagents/')
   const tokenSamples: TokenSample[] = []
   const requestSamples: RequestSample[] = []
   const toolBreakdown: Record<string, number> = {}
@@ -108,8 +125,10 @@ export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<M
     const message = asRecord(parsed.message)
     const role = getString(message?.role) || type
 
-    if (message?.model) {
-      model = getString(message.model) || model
+    // <synthetic> 是 Claude Code 本地生成的占位消息（如中断提示），没有真实用量。
+    const messageModel = getString(message?.model)
+    if (messageModel && messageModel !== '<synthetic>') {
+      model = messageModel
     }
 
     if (role === 'user' || type === 'user') {
@@ -123,25 +142,38 @@ export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<M
     }
 
     if (role === 'assistant' || type === 'assistant') {
-      assistantMessageCount += 1
-      requestSamples.push({ timestampMs, kind: 'assistant' })
       const rawUsage = asRecord(message?.usage)
-      addUsage(usage, rawUsage)
-      if (rawUsage && timestampMs > 0) {
-        tokenSamples.push({
-          timestampMs,
-          totalTokens:
-            asNumber(rawUsage.input_tokens) +
-            asNumber(rawUsage.cache_read_input_tokens) +
-            asNumber(rawUsage.cache_creation_input_tokens) +
-            asNumber(rawUsage.output_tokens) +
-            asNumber(rawUsage.reasoning_output_tokens),
-          inputTokens: asNumber(rawUsage.input_tokens),
-          cachedInputTokens:
-            asNumber(rawUsage.cache_read_input_tokens) +
-            asNumber(rawUsage.cache_creation_input_tokens),
-          outputTokens: asNumber(rawUsage.output_tokens),
-        })
+      let isDuplicate = false
+      if (rawUsage) {
+        const sampleUsage = normalizeClaudeUsage(rawUsage)
+        quality.rawUsageRecords += 1
+        const dedupKey = getClaudeDedupKey(parsed, message)
+        isDuplicate = Boolean(dedupKey) && seenKeys.has(dedupKey)
+        if (isDuplicate) {
+          quality.duplicateRecords += 1
+          quality.duplicateTokens += sampleUsage.totalTokens
+        } else {
+          if (dedupKey) {
+            seenKeys.add(dedupKey)
+          }
+          quality.countedUsageRecords += 1
+          if (sampleUsage.cacheWrite1hTokens > sampleUsage.cacheWriteTokens) {
+            quality.invariantViolations += 1
+          }
+          addUsage(usage, sampleUsage)
+          if (timestampMs > 0 && sampleUsage.totalTokens > 0) {
+            tokenSamples.push({
+              ...sampleUsage,
+              timestampMs,
+              contextTokens: sampleUsage.inputTokens + sampleUsage.cachedInputTokens + sampleUsage.cacheWriteTokens,
+              model: messageModel,
+            })
+          }
+        }
+      }
+      if (!isDuplicate) {
+        assistantMessageCount += 1
+        requestSamples.push({ timestampMs, kind: 'assistant' })
       }
       const messageText = getMessageText(message)
       if (!preview && messageText) {
@@ -161,7 +193,7 @@ export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<M
         }
       }
 
-      const serverToolUse = asRecord(rawUsage?.server_tool_use)
+      const serverToolUse = isDuplicate ? null : asRecord(rawUsage?.server_tool_use)
       if (serverToolUse) {
         for (const [toolName, count] of Object.entries(serverToolUse)) {
           const numericCount = asNumber(count)
@@ -175,13 +207,13 @@ export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<M
     }
   }
 
-  id = id || entry.path.split('/').pop()?.replace('.jsonl', '') || entry.path
-  const createdAtMs = firstEventAtMs || lastEventAtMs || entry.file.lastModified
+  const fileId = entryPath.split('/').pop()?.replace('.jsonl', '') || entryPath
+  // 子代理文件与父会话共用 sessionId，用文件名区分，避免会话被合并。
+  id = isSubagent ? `${id || 'subagent'}:${fileId}` : id || fileId
+  const createdAtMs = firstEventAtMs || lastEventAtMs || lastModifiedMs
   const updatedAtMs = lastEventAtMs || createdAtMs
-  const resolvedCwd = cwd || makeProjectFromPath(entry.path) || 'unknown'
-  const totalTokens =
-    usage.totalTokens ||
-    usage.inputTokens + usage.cachedInputTokens + usage.outputTokens + usage.reasoningOutputTokens
+  const resolvedCwd = cwd || makeProjectFromPath(entryPath) || 'unknown'
+  const totalTokens = usage.totalTokens
 
   if (!id) {
     return null
@@ -190,7 +222,7 @@ export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<M
   return {
     id,
     rolloutPath: '',
-    sessionFilePath: entry.path,
+    sessionFilePath: entryPath,
     cwd: resolvedCwd,
     title: title || firstUserMessage || 'Untitled Claude Session',
     preview: preview || firstUserMessage,
@@ -203,10 +235,7 @@ export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<M
     lastEventAtMs: updatedAtMs,
     archived: false,
     cliVersion: '',
-    usage: {
-      ...usage,
-      totalTokens,
-    },
+    usage,
     threadTokensUsed: 0,
     resolvedTotalTokens: totalTokens,
     userMessageCount,
@@ -220,7 +249,18 @@ export async function parseClaudeSessionFile(entry: VirtualFileEntry): Promise<M
     eventCount,
     durationMs: Math.max(0, updatedAtMs - createdAtMs),
     usageConflict: false,
+    quality,
+    isSubagent,
   }
+}
+
+/** 主会话先于子代理解析，重复记录归属到主会话。 */
+export function sortClaudeEntries<T extends { path: string }>(entries: T[]) {
+  return entries.sort((left, right) => {
+    const leftSub = left.path.includes('/subagents/') ? 1 : 0
+    const rightSub = right.path.includes('/subagents/') ? 1 : 0
+    return leftSub - rightSub || left.path.localeCompare(right.path)
+  })
 }
 
 export async function parseClaudeEntries(
@@ -237,13 +277,15 @@ export async function parseClaudeEntries(
   }
 
   const sessions: MergedSession[] = []
+  const seenKeys = new Set<string>()
+  sortClaudeEntries(sessionFiles)
   for (const [index, entry] of sessionFiles.entries()) {
     onProgress?.({
       phase: '正在解析 Claude Code jsonl',
       processed: index + 1,
       total: sessionFiles.length,
     })
-    const session = await parseClaudeSessionFile(entry)
+    const session = await parseClaudeSessionFile(entry, seenKeys)
     if (session) {
       sessions.push(session)
     }

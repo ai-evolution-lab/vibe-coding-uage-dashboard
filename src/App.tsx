@@ -16,9 +16,12 @@ import {
   HardDriveDownload,
   RefreshCw,
   Sparkles,
-  Wrench,
 } from 'lucide-react'
+import { ActivityHeatmap } from './components/ActivityHeatmap'
 import { ChartCard } from './components/ChartCard'
+import { DataQualityPanel } from './components/DataQualityPanel'
+import { PricingPanel } from './components/PricingPanel'
+import { TokenBreakdown } from './components/TokenBreakdown'
 import { SessionDetailDrawer } from './components/SessionDetailDrawer'
 import { SessionTable } from './components/SessionTable'
 import { StatCard } from './components/StatCard'
@@ -44,25 +47,44 @@ import {
 } from './lib/format'
 import { hasLocalApi, loadLocalApiDataset } from './lib/localApi'
 import {
+  buildDailyActivity,
   buildHourlyBuckets,
   buildMetricSnapshot,
   getAvailableSessionDays,
   getAvailableModels,
   getAvailableProjects,
-  getDefaultPriceRules,
   getFilterDefaults,
-  hasExplicitPriceRule,
 } from './lib/metrics'
+import { AUTO_UPDATE_INTERVAL_MS, createPricingIndex, fetchLatestCatalog, getBuiltinCatalog } from './lib/pricing'
 import {
   clearStoredState,
   loadCache,
   loadDirectoryHandle,
-  loadPriceRules,
+  loadPricingCatalog,
   saveCache,
   saveDirectoryHandle,
-  savePriceRules,
+  savePricingCatalog,
 } from './lib/storage'
-import type { DashboardData, FilterState, LoadProgress, MergedSession, PriceRule, ProviderType } from './types'
+import type { DashboardData, FilterState, LoadProgress, MergedSession, PriceRule, PricingCatalog, ProviderType } from './types'
+
+type ViewTab = 'overview' | 'sessions' | 'pricing' | 'quality'
+
+const viewTabs: Array<{ value: ViewTab; label: string }> = [
+  { value: 'overview', label: '概览' },
+  { value: 'sessions', label: '会话' },
+  { value: 'pricing', label: '价格表' },
+  { value: 'quality', label: '数据质量' },
+]
+
+const AUTO_UPDATE_KEY = 'vcud.pricing.autoUpdate'
+
+function readAutoUpdatePreference() {
+  try {
+    return localStorage.getItem(AUTO_UPDATE_KEY) !== 'off'
+  } catch {
+    return true
+  }
+}
 
 interface DirectoryInputProps extends InputHTMLAttributes<HTMLInputElement> {
   webkitdirectory?: string
@@ -133,7 +155,12 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [progress, setProgress] = useState<LoadProgress | null>(null)
   const [error, setError] = useState('')
-  const [priceRules, setPriceRules] = useState<PriceRule[]>(getDefaultPriceRules())
+  const [catalog, setCatalog] = useState<PricingCatalog>(() => getBuiltinCatalog())
+  const [catalogReady, setCatalogReady] = useState(false)
+  const [pricingUpdating, setPricingUpdating] = useState(false)
+  const [pricingMessage, setPricingMessage] = useState('')
+  const [autoUpdatePricing, setAutoUpdatePricing] = useState(readAutoUpdatePreference)
+  const [activeTab, setActiveTab] = useState<ViewTab>('overview')
   const [filters, setFilters] = useState<FilterState>(getFilterDefaults())
   const [sourceHandle, setSourceHandle] = useState<FileSystemDirectoryHandle | null>(null)
   const [rememberedHandle, setRememberedHandle] = useState(false)
@@ -151,14 +178,19 @@ function App() {
 
     async function bootstrap() {
       try {
-        const [storedPriceRules] = await Promise.all([loadPriceRules()])
+        const storedCatalog = await loadPricingCatalog()
         if (cancelled) {
           return
         }
         setBrowserSupport({ directoryPicker: supportsDirectoryPicker() })
-        if (storedPriceRules?.length) {
-          setPriceRules(storedPriceRules)
+        const builtin = getBuiltinCatalog()
+        // 内置快照比已保存的在线价格更新时（升级了版本），用快照并保留自定义价格。
+        if (storedCatalog && storedCatalog.updatedAtMs >= builtin.updatedAtMs) {
+          setCatalog(storedCatalog)
+        } else if (storedCatalog) {
+          setCatalog({ ...builtin, overrides: storedCatalog.overrides })
         }
+        setCatalogReady(true)
       } catch (bootstrapError) {
         if (!cancelled) {
           setError(bootstrapError instanceof Error ? bootstrapError.message : '初始化失败，请稍后重试。')
@@ -232,8 +264,55 @@ function App() {
   }, [provider])
 
   useEffect(() => {
-    void savePriceRules(priceRules)
-  }, [priceRules])
+    if (catalogReady) {
+      void savePricingCatalog(catalog)
+    }
+  }, [catalog, catalogReady])
+
+  async function handleUpdatePricing(options?: { silent?: boolean }) {
+    setPricingUpdating(true)
+    if (!options?.silent) {
+      setPricingMessage('')
+    }
+    try {
+      const next = await fetchLatestCatalog(catalog.overrides)
+      const added = next.rules.length - catalog.rules.length
+      setCatalog(next)
+      setPricingMessage(`已更新：${next.rules.length} 个模型${added > 0 ? `，新增 ${added} 个` : ''}。`)
+    } catch (updateError) {
+      if (!options?.silent) {
+        setPricingMessage(updateError instanceof Error ? updateError.message : '价格更新失败')
+      }
+    } finally {
+      setPricingUpdating(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!catalogReady || !autoUpdatePricing) {
+      return
+    }
+    if (Date.now() - catalog.updatedAtMs <= AUTO_UPDATE_INTERVAL_MS) {
+      return
+    }
+    const timer = window.setTimeout(() => void handleUpdatePricing({ silent: true }), 1500)
+    return () => window.clearTimeout(timer)
+    // 只在启动后检查一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogReady])
+
+  function changeAutoUpdate(value: boolean) {
+    setAutoUpdatePricing(value)
+    try {
+      localStorage.setItem(AUTO_UPDATE_KEY, value ? 'on' : 'off')
+    } catch {
+      // 浏览器禁用存储时只在本次会话生效
+    }
+  }
+
+  function changeOverrides(overrides: PriceRule[]) {
+    setCatalog((current) => ({ ...current, overrides }))
+  }
 
   async function parseEntriesForProvider(
     entries: Awaited<ReturnType<typeof readEntriesFromHandle>>,
@@ -363,7 +442,7 @@ function App() {
     setSourceHandle(null)
     setRememberedHandle(false)
     setLastLoadedFromCache(false)
-    setPriceRules(getDefaultPriceRules())
+    setCatalog(getBuiltinCatalog())
     setFilters(getFilterDefaults())
   }
 
@@ -397,16 +476,28 @@ function App() {
 
   const models = useMemo(() => (dataset ? getAvailableModels(dataset.sessions) : ['all']), [dataset])
   const projects = useMemo(() => (dataset ? getAvailableProjects(dataset.sessions) : ['all']), [dataset])
+  const pricing = useMemo(() => createPricingIndex(catalog), [catalog])
   const snapshot = useMemo(
-    () => (dataset ? buildMetricSnapshot(dataset, filters, priceRules) : null),
-    [dataset, filters, priceRules],
+    () => (dataset ? buildMetricSnapshot(dataset, filters, pricing) : null),
+    [dataset, filters, pricing],
   )
-  const unmatchedModels = useMemo(() => {
-    const sessionModels = new Set((dataset?.sessions ?? []).map((session) => session.model).filter(Boolean))
-    return Array.from(sessionModels)
-      .filter((model) => !hasExplicitPriceRule(model, priceRules))
-      .sort()
-  }, [dataset, priceRules])
+  const dailyActivity = useMemo(
+    () => (dataset ? buildDailyActivity(dataset, filters, pricing) : []),
+    [dataset, filters, pricing],
+  )
+  const usedModels = useMemo(() => {
+    const names = new Set<string>()
+    for (const session of dataset?.sessions ?? []) {
+      for (const sample of session.tokenSamples) {
+        names.add(sample.model || session.model)
+      }
+      if (session.tokenSamples.length === 0 && session.model) {
+        names.add(session.model)
+      }
+    }
+    // unknown 只出现在没有会话文件、只有 sqlite 总数的线程上，这部分本来就无法计价。
+    return [...names].filter((name) => name && name !== 'unknown').sort()
+  }, [dataset])
   const hourlyDateOptions = useMemo(
     () => (snapshot ? getAvailableSessionDays(snapshot.filteredSessions) : []),
     [snapshot],
@@ -430,9 +521,7 @@ function App() {
 
   const trendModels = useMemo(
     () =>
-      snapshot
-        ? [...new Set(snapshot.trend.flatMap((item) => Object.keys(item.byModel)))].filter(Boolean).slice(0, 8)
-        : [],
+      snapshot ? snapshot.modelRanks.map((rank) => rank.key).filter(Boolean).slice(0, 8) : [],
     [snapshot],
   )
 
@@ -441,8 +530,9 @@ function App() {
       return {}
     }
     return {
-      legend: { top: 4, textStyle: { color: '#c8d2e0' } },
-      grid: { top: 48, left: 24, right: 16, bottom: 28, containLabel: true },
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      legend: { type: 'scroll', top: 0, textStyle: { color: '#c8d2e0' } },
+      grid: { top: 44, left: 24, right: 16, bottom: 28, containLabel: true },
       xAxis: {
         type: 'category',
         data: snapshot.trend.map((item) => item.bucketLabel),
@@ -652,509 +742,331 @@ function App() {
       ...current,
       cwd: target,
     }))
+    setActiveTab('sessions')
     requestAnimationFrame(() => {
       sessionSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     })
   }
 
+  const cardClass = 'rounded-2xl border border-white/8 bg-[#11141b]'
+  const ghostButton =
+    'inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50'
+  const selectClass = 'rounded-xl border border-white/10 bg-[#0d1016] px-3 py-2 text-sm text-slate-100 outline-none'
+  const qualityWarnings = snapshot
+    ? (snapshot.unpricedModels.length > 0 ? 1 : 0) + (snapshot.quality.invariantViolations > 0 ? 1 : 0)
+    : 0
+
   return (
     <div className="min-h-screen bg-[#090b11] text-slate-100">
       <input ref={fileInputRef} type="file" multiple onChange={handleFallbackSelect} className="hidden" {...directoryInputProps} />
 
-      <div className="mx-auto flex max-w-[1720px] flex-col gap-6 px-4 py-5 sm:px-6 xl:px-8 2xl:px-10">
-        <header className="rounded-[24px] border border-white/8 bg-[#10131a] px-5 py-5 shadow-[0_32px_80px_rgba(0,0,0,0.35)] lg:px-6">
-          <div className="flex flex-col gap-5 xl:flex-row xl:items-end xl:justify-between">
-            <div className="min-w-0">
-              <p className="text-sm text-slate-400">{providerLabel.title}</p>
-              <h1 className="mt-2 text-3xl font-semibold tracking-normal text-white sm:text-[40px]">Vibe Coding Usage Dashboard</h1>
-              <p className="mt-3 max-w-4xl text-sm leading-6 text-slate-400">
-                自动或手动读取本机 <code className="rounded bg-white/8 px-1.5 py-0.5 text-slate-200">{providerLabel.home}</code>，
-                按全局、项目文件夹、标题、模型、时间和工具调用统计 tokens。数据只在本机处理，不上传。
-              </p>
+      <div className="mx-auto flex max-w-[1480px] flex-col gap-5 px-4 py-5 sm:px-6 xl:px-8">
+        <header className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="min-w-0">
+            <h1 className="text-2xl font-semibold text-white">Vibe Coding Usage</h1>
+            <p className="mt-1 text-xs text-slate-500">
+              本机读取 {providerLabel.home}，数据不上传。费用为按公开价格的估算，不是官方账单。
+              {dataset ? ` · ${getSourceTypeLabel(dataset.sourceSummary.sourceType)} · 解析于 ${formatDateTime(dataset.sourceSummary.parsedAtMs)}${lastLoadedFromCache ? '（缓存）' : ''}` : ''}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex rounded-full border border-white/10 bg-[#0d1016] p-1">
+              {(['codex', 'claude'] as ProviderType[]).map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => changeProvider(item)}
+                  className={`rounded-full px-4 py-1.5 text-sm transition ${
+                    provider === item ? 'bg-[#2a78d6] text-white' : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {providerLabels[item].name}
+                </button>
+              ))}
             </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex rounded-full border border-white/10 bg-[#0d1016] p-1">
-                {(['codex', 'claude'] as ProviderType[]).map((item) => (
+            <button
+              type="button"
+              onClick={handleAutoDetect}
+              disabled={loading || !localApiAvailable}
+              className="inline-flex items-center gap-2 rounded-full bg-[#2a78d6] px-4 py-2 text-sm font-medium text-white transition hover:bg-[#3987e5] disabled:cursor-not-allowed disabled:opacity-50"
+              title={localApiAvailable ? '自动识别本地数据目录' : '请用 npm run start:local、open.command 或 open.bat 启动'}
+            >
+              <Bot size={16} />
+              自动识别
+            </button>
+            <button type="button" onClick={handleRefresh} disabled={loading || !dataset} className={ghostButton}>
+              <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+              刷新
+            </button>
+            <details className="relative">
+              <summary className={`${ghostButton} cursor-pointer list-none`}>
+                <FolderOpen size={16} />
+                手动选择
+              </summary>
+              <div className="absolute right-0 z-20 mt-2 flex w-56 flex-col gap-1 rounded-xl border border-white/10 bg-[#141821] p-2 shadow-xl">
+                <button
+                  type="button"
+                  onClick={handleChooseDirectory}
+                  disabled={!browserSupport.directoryPicker || loading}
+                  className="rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/6 disabled:opacity-40"
+                >
+                  授权 {providerLabel.home} 目录
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/6"
+                >
+                  <HardDriveDownload size={14} />
+                  选择文件夹（兼容模式）
+                </button>
+                <button type="button" onClick={handleClearCache} className="rounded-lg px-3 py-2 text-left text-sm text-slate-400 hover:bg-white/6">
+                  清空本地缓存
+                </button>
+              </div>
+            </details>
+          </div>
+        </header>
+
+        {!localApiAvailable ? (
+          <p className="text-xs text-[#fab219]">
+            当前不是本地启动模式，自动识别已禁用。请使用 `npm run start:local`、`open.command` 或 `open.bat`。
+          </p>
+        ) : null}
+
+        {error ? (
+          <div className="flex items-start gap-3 rounded-2xl border border-rose-500/25 bg-rose-500/10 px-5 py-4 text-sm text-rose-100">
+            <AlertCircle size={18} className="mt-0.5 shrink-0" />
+            <span>{error}</span>
+          </div>
+        ) : null}
+
+        {loading && progress ? (
+          <div className="rounded-2xl border border-[#3987e5]/25 bg-[#3987e5]/8 px-5 py-4 text-sm text-slate-100">
+            <div className="flex items-center justify-between gap-4">
+              <span>{progress.phase}</span>
+              <span>{progress.processed}/{progress.total}</span>
+            </div>
+            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/10">
+              <div className="h-full rounded-full bg-[#3987e5] transition-all" style={{ width: `${progress.total > 0 ? (progress.processed / progress.total) * 100 : 0}%` }} />
+            </div>
+          </div>
+        ) : null}
+
+        {snapshot ? (
+          <>
+            <nav className="flex flex-col gap-3 border-b border-white/8 lg:flex-row lg:items-end lg:justify-between">
+              <div className="flex gap-1 overflow-x-auto">
+                {viewTabs.map((tab) => (
                   <button
-                    key={item}
+                    key={tab.value}
                     type="button"
-                    onClick={() => changeProvider(item)}
-                    className={`rounded-full px-4 py-2 text-sm transition ${
-                      provider === item ? 'bg-[#4f7cff] text-white' : 'text-slate-400 hover:text-white'
+                    onClick={() => setActiveTab(tab.value)}
+                    className={`-mb-px whitespace-nowrap border-b-2 px-4 py-2.5 text-sm transition ${
+                      activeTab === tab.value ? 'border-[#3987e5] text-white' : 'border-transparent text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    {providerLabels[item].name}
+                    {tab.label}
+                    {tab.value === 'quality' && qualityWarnings > 0 ? (
+                      <span className="ml-1.5 rounded-full bg-[#fab219] px-1.5 text-[11px] text-[#0b0b0b]">{qualityWarnings}</span>
+                    ) : null}
                   </button>
                 ))}
               </div>
-              <button
-                type="button"
-                onClick={handleAutoDetect}
-                disabled={loading || !localApiAvailable}
-                className="inline-flex items-center gap-2 rounded-full bg-[#4f7cff] px-4 py-2.5 text-sm font-medium text-white transition hover:bg-[#648bff] disabled:cursor-not-allowed disabled:opacity-50"
-                title={localApiAvailable ? '自动识别本地数据目录' : '请用 npm run start:local、open.command 或 open.bat 启动'}
-              >
-                <Bot size={18} />
-                自动识别
-              </button>
-              <button
-                type="button"
-                onClick={handleChooseDirectory}
-                disabled={!browserSupport.directoryPicker || loading}
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <FolderOpen size={18} />
-                手动选择 {providerLabel.name}
-              </button>
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-slate-200 transition hover:bg-white/10"
-              >
-                <HardDriveDownload size={18} />
-                回退选文件夹
-              </button>
-              <button
-                type="button"
-                onClick={handleRefresh}
-                disabled={loading || !dataset}
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
-                刷新
-              </button>
-            </div>
-          </div>
-          {!localApiAvailable ? (
-            <p className="mt-3 text-xs text-amber-300">
-              当前不是本地启动模式，自动识别已禁用。请使用 `npm run start:local`、`open.command` 或 `open.bat`。
-            </p>
-          ) : null}
-        </header>
+              <div className="flex flex-wrap items-center gap-2 pb-2">
+                <div className="flex rounded-xl border border-white/10 bg-[#0d1016] p-1">
+                  {timeRangeOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => changeTimeRange(option.value)}
+                      className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-xs transition ${
+                        filters.timeRange === option.value ? 'bg-[#2a78d6] text-white' : 'text-slate-400 hover:text-slate-100'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <select value={filters.model} onChange={(event) => setFilters((current) => ({ ...current, model: event.target.value }))} className={selectClass} aria-label="模型">
+                  {models.map((model) => <option key={model} value={model}>{model === 'all' ? '全部模型' : model}</option>)}
+                </select>
+                <select value={filters.cwd} onChange={(event) => setFilters((current) => ({ ...current, cwd: event.target.value }))} className={`${selectClass} max-w-[220px]`} aria-label="项目">
+                  {projects.map((project) => <option key={project} value={project}>{project === 'all' ? '全部项目' : getProjectLeaf(project)}</option>)}
+                </select>
+                {provider === 'codex' ? (
+                  <select value={filters.archived} onChange={(event) => setFilters((current) => ({ ...current, archived: event.target.value as FilterState['archived'] }))} className={selectClass} aria-label="归档状态">
+                    <option value="all">全部会话</option>
+                    <option value="active">未归档</option>
+                    <option value="archived">已归档</option>
+                  </select>
+                ) : null}
+              </div>
+            </nav>
 
-        <section className="grid gap-6 2xl:grid-cols-[minmax(0,1fr)_380px]">
-          <div className="flex min-w-0 flex-col gap-6">
-            {error ? (
-              <div className="flex items-start gap-3 rounded-2xl border border-rose-500/25 bg-rose-500/10 px-5 py-4 text-sm text-rose-100">
-                <AlertCircle size={18} className="mt-0.5 shrink-0" />
-                <span>{error}</span>
+            {filters.timeRange === 'custom' ? (
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <CalendarDays size={16} className="text-slate-500" />
+                <input type="date" value={filters.customStartDate} onChange={(event) => setFilters((current) => ({ ...current, customStartDate: event.target.value }))} className={selectClass} aria-label="开始日期" />
+                <ArrowRight size={14} className="text-slate-500" />
+                <input type="date" value={filters.customEndDate} onChange={(event) => setFilters((current) => ({ ...current, customEndDate: event.target.value }))} className={selectClass} aria-label="结束日期" />
+                <button type="button" onClick={() => { const today = getLocalDateInputValue(); setCustomDateRange(today, today) }} className={ghostButton}>今天</button>
               </div>
             ) : null}
 
-            {loading && progress ? (
-              <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/8 px-5 py-4 text-sm text-cyan-100">
-                <div className="flex items-center justify-between gap-4">
-                  <span>{progress.phase}</span>
-                  <span>{progress.processed}/{progress.total}</span>
-                </div>
-                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
-                  <div className="h-full rounded-full bg-cyan-400 transition-all" style={{ width: `${progress.total > 0 ? (progress.processed / progress.total) * 100 : 0}%` }} />
-                </div>
-              </div>
-            ) : null}
-
-            {snapshot ? (
+            {activeTab === 'overview' ? (
               <>
                 <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                  <StatCard title="总 Tokens" valuePrimary={totalTokenValue?.primary ?? '0'} valuePrefix={totalTokenValue?.prefix} valueUnit={totalTokenValue?.unit} hint={`输入 ${formatCompact(snapshot.inputTokens, 2)} / 输出 ${formatCompact(snapshot.outputTokens, 2)}`} icon={Sparkles} accentClass="bg-[#4f7cff]" trend={snapshot.sparklineTokens} />
-                  <StatCard title="会话统计" valuePrimary={sessionValue?.primary ?? '0'} valuePrefix={sessionValue?.prefix} valueUnit={sessionValue?.unit} hint={`轮次 ${formatNumber(snapshot.interactionTurns)} / 工具调用 ${formatNumber(snapshot.toolCalls)}`} icon={BarChart3} accentClass="bg-[#12b981]" trend={snapshot.sparklineSessions} />
-                  <StatCard title="估算费用" valuePrimary={costValue?.primary ?? '0'} valuePrefix={costValue?.prefix} valueUnit={costValue?.unit} hint={`缓存输入 ${formatCompact(snapshot.cachedInputTokens, 2)} / 活跃 ${formatNumber(snapshot.activeDays)} 天`} icon={DollarSign} accentClass="bg-[#f59e0b]" trend={snapshot.sparklineCost} />
-                  <StatCard title="性能指标" valuePrimary={tpmValue?.primary ?? '0'} valuePrefix={tpmValue?.prefix} valueUnit={tpmValue?.unit} hint={`平均 RPM ${formatNumber(snapshot.avgRpm, 3)} / 平均时长 ${formatDuration(snapshot.avgSessionDurationMs)}`} icon={Gauge} accentClass="bg-[#8b5cf6]" trend={snapshot.sparklineTpm} />
+                  <StatCard title="总 Tokens" valuePrimary={totalTokenValue?.primary ?? '0'} valuePrefix={totalTokenValue?.prefix} valueUnit={totalTokenValue?.unit} hint={`缓存读取 ${formatCompact(snapshot.cachedInputTokens, 2)} / 输出 ${formatCompact(snapshot.outputTokens, 2)}`} icon={Sparkles} accentClass="bg-[#2a78d6]" trend={snapshot.sparklineTokens} />
+                  <StatCard title="估算费用" valuePrimary={costValue?.primary ?? '0'} valuePrefix={costValue?.prefix} valueUnit={costValue?.unit} hint={snapshot.unpricedModels.length ? `${snapshot.unpricedModels.length} 个模型无价格，见数据质量` : `活跃 ${formatNumber(snapshot.activeDays)} 天，日均 ${formatCurrency(snapshot.activeDays ? snapshot.estimatedCost / snapshot.activeDays : 0)}`} icon={DollarSign} accentClass="bg-[#c98500]" trend={snapshot.sparklineCost} />
+                  <StatCard title="会话" valuePrimary={sessionValue?.primary ?? '0'} valuePrefix={sessionValue?.prefix} valueUnit={sessionValue?.unit} hint={`轮次 ${formatNumber(snapshot.interactionTurns)} / 工具调用 ${formatNumber(snapshot.toolCalls)}`} icon={BarChart3} accentClass="bg-[#199e70]" trend={snapshot.sparklineSessions} />
+                  <StatCard title="平均 TPM" valuePrimary={tpmValue?.primary ?? '0'} valuePrefix={tpmValue?.prefix} valueUnit={tpmValue?.unit} hint={`平均 RPM ${formatNumber(snapshot.avgRpm, 2)} / 会话平均 ${formatDuration(snapshot.avgSessionDurationMs)}`} icon={Gauge} accentClass="bg-[#6250d6]" trend={snapshot.sparklineTpm} />
                 </div>
 
-                <section className="rounded-2xl border border-white/8 bg-[#11141b] px-5 py-5 shadow-[0_24px_60px_rgba(0,0,0,0.28)]">
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-                    <div>
-                      <h2 className="text-sm font-semibold text-white">筛选、搜索与导出</h2>
-                      <p className="mt-1 text-xs text-slate-400">
-                        {providerLabel.name} / {getSourceTypeLabel(dataset?.sourceSummary.sourceType ?? 'file-list')}，
-                        最后解析 {formatDateTime(dataset?.sourceSummary.parsedAtMs ?? 0)}
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <button type="button" onClick={() => setPriceRules((current) => [...current, { model: `custom-${current.length + 1}`, inputPerMillion: 0, cachedInputPerMillion: 0, outputPerMillion: 0 }])} className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10">
-                        新增规则
-                      </button>
-                      <button type="button" onClick={() => setPriceRules(getDefaultPriceRules())} className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10">
-                        恢复默认价格表
-                      </button>
-                      <button type="button" onClick={() => exportSessionsCsv(snapshot.filteredSessions, provider)} className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10">
-                        导出 CSV
-                      </button>
-                      <button type="button" onClick={() => exportMetricsJson(snapshot, provider)} className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10">
-                        导出 JSON
-                      </button>
-                    </div>
-                  </div>
+                <TokenBreakdown
+                  inputTokens={snapshot.inputTokens}
+                  cachedInputTokens={snapshot.cachedInputTokens}
+                  cacheWriteTokens={snapshot.cacheWriteTokens}
+                  outputTokens={snapshot.outputTokens}
+                  cost={snapshot.costBreakdown}
+                />
 
-                  <div className="mt-5 grid gap-3 lg:grid-cols-6">
-                    <div className="flex flex-col gap-2 text-xs text-slate-400 lg:col-span-2">
-                      时间范围
-                      <div className="grid grid-cols-2 gap-1 rounded-2xl border border-white/10 bg-[#0d1016] p-1 sm:grid-cols-5">
-                        {timeRangeOptions.map((option) => (
-                          <button
-                            key={option.value}
-                            type="button"
-                            onClick={() => changeTimeRange(option.value)}
-                            className={`min-h-10 whitespace-nowrap rounded-xl px-3 text-xs font-medium transition sm:text-sm ${
-                              filters.timeRange === option.value
-                                ? 'bg-[#4f7cff] text-white shadow-[0_10px_24px_rgba(79,124,255,0.28)]'
-                                : 'text-slate-400 hover:bg-white/[0.06] hover:text-slate-100'
-                            }`}
-                          >
-                            {option.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <label className="flex flex-col gap-2 text-xs text-slate-400">
-                      粒度
-                      <select value={filters.granularity} onChange={(event) => setFilters((current) => ({ ...current, granularity: event.target.value as FilterState['granularity'] }))} className="rounded-2xl border border-white/10 bg-[#0d1016] px-4 py-3 text-sm text-slate-100 outline-none">
+                <ActivityHeatmap daily={dailyActivity} />
+
+                <div className="grid gap-5 xl:grid-cols-2">
+                  <ChartCard
+                    title="Tokens 趋势"
+                    subtitle="按模型堆叠"
+                    option={trendOption}
+                    height={320}
+                    headerActions={
+                      <select value={filters.granularity} onChange={(event) => setFilters((current) => ({ ...current, granularity: event.target.value as FilterState['granularity'] }))} className={selectClass} aria-label="粒度">
                         <option value="day">按天</option>
                         <option value="week">按周</option>
                         <option value="month">按月</option>
                       </select>
-                    </label>
-                    <label className="flex flex-col gap-2 text-xs text-slate-400">
-                      模型
-                      <select value={filters.model} onChange={(event) => setFilters((current) => ({ ...current, model: event.target.value }))} className="rounded-2xl border border-white/10 bg-[#0d1016] px-4 py-3 text-sm text-slate-100 outline-none">
-                        {models.map((model) => <option key={model} value={model}>{model === 'all' ? '全部模型' : model}</option>)}
-                      </select>
-                    </label>
-                    <label className="flex flex-col gap-2 text-xs text-slate-400">
-                      项目目录
-                      <select value={filters.cwd} onChange={(event) => setFilters((current) => ({ ...current, cwd: event.target.value }))} className="rounded-2xl border border-white/10 bg-[#0d1016] px-4 py-3 text-sm text-slate-100 outline-none">
-                        {projects.map((project) => <option key={project} value={project}>{project === 'all' ? '全部项目' : trimText(project, 48)}</option>)}
-                      </select>
-                    </label>
-                    <label className="flex flex-col gap-2 text-xs text-slate-400">
-                      归档状态
-                      <select value={filters.archived} onChange={(event) => setFilters((current) => ({ ...current, archived: event.target.value as FilterState['archived'] }))} className="rounded-2xl border border-white/10 bg-[#0d1016] px-4 py-3 text-sm text-slate-100 outline-none">
-                        <option value="all">全部</option>
-                        <option value="active">未归档</option>
-                        <option value="archived">已归档</option>
-                      </select>
-                    </label>
-                  </div>
-
-                  {filters.timeRange === 'custom' ? (
-                    <div className="mt-3 flex flex-col gap-3 rounded-2xl border border-[#4f7cff]/20 bg-[#0d1016] px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="flex min-w-0 flex-1 flex-col gap-3 sm:flex-row sm:items-center">
-                        <div className="flex items-center gap-2 text-xs font-medium text-[#b6c8ff]">
-                          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#4f7cff]/15 text-[#8fb0ff]">
-                            <CalendarDays size={16} />
-                          </span>
-                          自定义日期
-                        </div>
-                        <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center">
-                          <input
-                            type="date"
-                            value={filters.customStartDate}
-                            onChange={(event) => setFilters((current) => ({ ...current, customStartDate: event.target.value }))}
-                            className="min-h-10 min-w-0 rounded-xl border border-white/10 bg-white/[0.03] px-3 text-sm text-slate-100 outline-none transition focus:border-[#4f7cff]/60"
-                            aria-label="开始日期"
-                          />
-                          <ArrowRight size={16} className="hidden text-slate-500 sm:block" />
-                          <input
-                            type="date"
-                            value={filters.customEndDate}
-                            onChange={(event) => setFilters((current) => ({ ...current, customEndDate: event.target.value }))}
-                            className="min-h-10 min-w-0 rounded-xl border border-white/10 bg-white/[0.03] px-3 text-sm text-slate-100 outline-none transition focus:border-[#4f7cff]/60"
-                            aria-label="结束日期"
-                          />
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const today = getLocalDateInputValue()
-                          setCustomDateRange(today, today)
-                        }}
-                        className="min-h-10 shrink-0 rounded-xl border border-white/10 bg-white/5 px-4 text-sm text-slate-200 transition hover:bg-white/10"
-                      >
-                        今天
-                      </button>
-                    </div>
-                  ) : null}
-
-                </section>
-
-                <div className="grid gap-6 xl:grid-cols-2">
-                  <ChartCard title="Tokens 趋势" subtitle="按筛选粒度分桶，展示模型消耗堆叠分布。" option={trendOption} height={340} />
-                  <ChartCard title="模型消耗排行" subtitle="按筛选结果统计各模型总 tokens。" option={modelOption} height={340} />
-                  <ChartCard
-                    title="小时分布"
-                    subtitle={resolvedHourlyDate === 'all' ? '基于当前筛选结果统计全部日期的 24 小时分布。' : `当前日期：${resolvedHourlyDate}`}
-                    option={hourlyOption}
-                    height={320}
-                    headerActions={
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => stepHourlyDate('prev')}
-                          disabled={hourlyDateOptions.length === 0 || (hourlyDate !== 'all' && hourlyDateIndex >= hourlyDateOptions.length - 1)}
-                          className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-300 transition hover:bg-white/10 disabled:opacity-40"
-                          title="前一天"
-                        >
-                          <ChevronLeft size={16} />
-                        </button>
-                        <input
-                          type="date"
-                          value={resolvedHourlyDate === 'all' ? '' : resolvedHourlyDate}
-                          onChange={(event) => setHourlyDate(event.target.value || 'all')}
-                          className="rounded-xl border border-white/10 bg-[#0d1016] px-3 py-1.5 text-xs text-slate-100 outline-none"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => stepHourlyDate('next')}
-                          disabled={resolvedHourlyDate === 'all' || hourlyDateIndex <= 0}
-                          className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-300 transition hover:bg-white/10 disabled:opacity-40"
-                          title="后一天"
-                        >
-                          <ChevronRight size={16} />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setHourlyDate('all')}
-                          className={`rounded-full border px-3 py-1.5 text-xs transition ${
-                            resolvedHourlyDate === 'all'
-                              ? 'border-[#4f7cff] bg-[#4f7cff]/15 text-white'
-                              : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'
-                          }`}
-                        >
-                          全部日期
-                        </button>
-                      </div>
                     }
                   />
-                  <ChartCard title="工具调用排行" subtitle="统计本地记录中的工具调用名称。" option={toolOption} height={320} />
+                  <ChartCard title="模型排行" subtitle="按总 tokens" option={modelOption} height={320} />
                   <ChartCard
-                    title="项目目录排行"
-                    subtitle="按 cwd 汇总 tokens、会话数和平均消耗，点击柱子可进入该项目会话。"
+                    title="项目排行"
+                    subtitle="点击柱子查看该项目的会话"
                     option={projectOption}
-                    height={380}
+                    height={340}
                     onChartClick={(params) => {
                       if (params.componentType === 'series') {
                         focusProjectFromChart(params.dataIndex)
                       }
                     }}
                   />
-                  <ChartCard title="会话规模分布" subtitle="按单会话 tokens 规模分桶，观察长尾会话。" option={distributionOption} height={320} />
-                </div>
-
-                <div ref={sessionSectionRef}>
-                  <SessionTable
-                    sessions={snapshot.filteredSessions}
-                    searchValue={filters.search}
-                    onSearchChange={(value) => setFilters((current) => ({ ...current, search: value }))}
-                    onSelectSession={setSelectedSession}
-                    activeProject={filters.cwd !== 'all' ? filters.cwd : ''}
-                    onClearProject={
-                      filters.cwd !== 'all'
-                        ? () => setFilters((current) => ({ ...current, cwd: 'all' }))
-                        : undefined
+                  <ChartCard
+                    title="小时分布"
+                    subtitle={resolvedHourlyDate === 'all' ? '全部日期' : resolvedHourlyDate}
+                    option={hourlyOption}
+                    height={340}
+                    headerActions={
+                      <div className="flex items-center gap-1.5">
+                        <button type="button" onClick={() => stepHourlyDate('prev')} disabled={hourlyDateOptions.length === 0 || (hourlyDate !== 'all' && hourlyDateIndex >= hourlyDateOptions.length - 1)} className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-300 hover:bg-white/10 disabled:opacity-40" title="前一天">
+                          <ChevronLeft size={16} />
+                        </button>
+                        <button type="button" onClick={() => stepHourlyDate('next')} disabled={resolvedHourlyDate === 'all' || hourlyDateIndex <= 0} className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-300 hover:bg-white/10 disabled:opacity-40" title="后一天">
+                          <ChevronRight size={16} />
+                        </button>
+                        <button type="button" onClick={() => setHourlyDate('all')} className={`rounded-full border px-3 py-1.5 text-xs ${resolvedHourlyDate === 'all' ? 'border-[#3987e5] text-white' : 'border-white/10 text-slate-300 hover:bg-white/10'}`}>
+                          全部
+                        </button>
+                      </div>
                     }
                   />
+                  <ChartCard title="工具调用排行" option={toolOption} height={320} />
+                  <ChartCard title="会话规模分布" subtitle="按单会话 tokens 分桶" option={distributionOption} height={320} />
                 </div>
               </>
-            ) : (
-              <section className="rounded-[24px] border border-dashed border-white/10 bg-[#10131a] px-6 py-10 text-center shadow-[0_24px_60px_rgba(0,0,0,0.28)]">
-                <div className="mx-auto flex max-w-2xl flex-col items-center">
-                  <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#4f7cff]/15 text-[#7da2ff]">
-                    <Database size={28} />
-                  </div>
-                  <h2 className="mt-5 text-2xl font-semibold text-white">还没有加载 {providerLabel.name} 数据</h2>
-                  <p className="mt-3 text-sm leading-6 text-slate-400">
-                    优先点击“自动识别”读取本机 <code className="rounded bg-white/8 px-1.5 py-0.5 text-slate-200">{providerLabel.home}</code>。
-                    如果不是通过双击脚本或 <code className="rounded bg-white/8 px-1.5 py-0.5 text-slate-200">npm run start:local</code> 启动，再手动选择目录。
-                    数据源：<code className="rounded bg-white/8 px-1.5 py-0.5 text-slate-200">{providerLabel.files}</code>。
-                  </p>
-                  <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-                    <button type="button" onClick={handleAutoDetect} disabled={!localApiAvailable} className="rounded-full bg-[#4f7cff] px-5 py-2.5 text-sm font-medium text-white transition hover:bg-[#648bff] disabled:cursor-not-allowed disabled:opacity-50">
-                      自动识别
-                    </button>
-                    <button type="button" onClick={handleChooseDirectory} className="rounded-full border border-white/10 bg-white/5 px-5 py-2.5 text-sm text-slate-200 transition hover:bg-white/10">
-                      手动选择目录
-                    </button>
-                    <button type="button" onClick={() => fileInputRef.current?.click()} className="rounded-full border border-white/10 bg-white/5 px-5 py-2.5 text-sm text-slate-200 transition hover:bg-white/10">
-                      文件夹回退模式
-                    </button>
-                  </div>
-                </div>
-              </section>
-            )}
-          </div>
+            ) : null}
 
-          <aside className="flex min-w-0 flex-col gap-6">
-            <section className="rounded-2xl border border-white/8 bg-[#11141b] px-5 py-5 shadow-[0_24px_60px_rgba(0,0,0,0.28)]">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#4f7cff]/15 text-[#7da2ff]">
-                  <Database size={18} />
+            {activeTab === 'sessions' ? (
+              <div ref={sessionSectionRef} className="flex flex-col gap-3">
+                <div className="flex flex-wrap justify-end gap-2">
+                  <button type="button" onClick={() => exportSessionsCsv(snapshot.filteredSessions, provider)} className={ghostButton}>导出 CSV</button>
+                  <button type="button" onClick={() => exportMetricsJson(snapshot, provider)} className={ghostButton}>导出 JSON</button>
                 </div>
-                <div>
-                  <h2 className="text-sm font-semibold text-white">数据源状态</h2>
-                  <p className="mt-1 text-xs text-slate-400">当前模式、缓存和本地读取状态。</p>
-                </div>
+                <SessionTable
+                  sessions={snapshot.filteredSessions}
+                  searchValue={filters.search}
+                  onSearchChange={(value) => setFilters((current) => ({ ...current, search: value }))}
+                  onSelectSession={setSelectedSession}
+                  activeProject={filters.cwd !== 'all' ? filters.cwd : ''}
+                  onClearProject={filters.cwd !== 'all' ? () => setFilters((current) => ({ ...current, cwd: 'all' })) : undefined}
+                />
               </div>
+            ) : null}
 
-              <div className="mt-5 space-y-4 text-sm">
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-slate-400">当前工具</span>
-                  <span className="text-slate-200">{providerLabel.name}</span>
-                </div>
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-slate-400">目录授权</span>
-                  <span className="text-slate-200">{sourceHandle ? '已连接' : rememberedHandle ? '已记住，待授权' : '未连接'}</span>
-                </div>
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-slate-400">目录选择器</span>
-                  <span className="text-slate-200">{browserSupport.directoryPicker ? '支持' : '不支持，建议回退模式'}</span>
-                </div>
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-slate-400">缓存状态</span>
-                  <span className="text-slate-200">{lastLoadedFromCache ? '已从缓存恢复' : dataset ? '实时数据' : '暂无数据'}</span>
-                </div>
-                {dataset ? (
-                  <>
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-slate-400">读取方式</span>
-                      <span className="text-slate-200">{getSourceTypeLabel(dataset.sourceSummary.sourceType)}</span>
-                    </div>
-                    {dataset.sourceSummary.detectedPath ? (
-                      <div>
-                        <span className="text-slate-400">识别路径</span>
-                        <p className="mt-1 break-all text-xs text-slate-300">{dataset.sourceSummary.detectedPath}</p>
+            {activeTab === 'pricing' ? (
+              <PricingPanel
+                catalog={catalog}
+                pricing={pricing}
+                usedModels={usedModels}
+                updating={pricingUpdating}
+                updateMessage={pricingMessage}
+                autoUpdate={autoUpdatePricing}
+                onAutoUpdateChange={changeAutoUpdate}
+                onUpdate={() => void handleUpdatePricing()}
+                onOverridesChange={changeOverrides}
+              />
+            ) : null}
+
+            {activeTab === 'quality' ? (
+              <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
+                <DataQualityPanel snapshot={snapshot} />
+                <section className={`${cardClass} px-5 py-5 text-sm`}>
+                  <h2 className="text-sm font-semibold text-white">数据源</h2>
+                  <dl className="mt-4 space-y-3">
+                    {[
+                      ['读取方式', getSourceTypeLabel(dataset?.sourceSummary.sourceType ?? 'file-list')],
+                      ['目录授权', sourceHandle ? '已连接' : rememberedHandle ? '已记住，待授权' : '未连接'],
+                      ['识别路径', dataset?.sourceSummary.detectedPath || '-'],
+                      ['文件数', formatNumber(dataset?.sourceSummary.fileCount ?? 0)],
+                      ['会话文件', formatNumber(dataset?.sourceSummary.sessionFileCount ?? 0)],
+                      ['会话数', formatNumber(dataset?.sourceSummary.sessionCount ?? 0)],
+                    ].map(([label, value]) => (
+                      <div key={label} className="flex justify-between gap-4">
+                        <dt className="shrink-0 text-slate-400">{label}</dt>
+                        <dd className="break-all text-right text-slate-200">{value}</dd>
                       </div>
-                    ) : null}
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-slate-400">文件数</span>
-                      <span className="text-slate-200">{formatNumber(dataset.sourceSummary.fileCount)}</span>
-                    </div>
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-slate-400">Session 文件</span>
-                      <span className="text-slate-200">{formatNumber(dataset.sourceSummary.sessionFileCount)}</span>
-                    </div>
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-slate-400">会话数</span>
-                      <span className="text-slate-200">{formatNumber(dataset.sourceSummary.sessionCount)}</span>
-                    </div>
-                  </>
-                ) : null}
+                    ))}
+                  </dl>
+                  <h3 className="mt-6 text-sm font-semibold text-white">计量规则</h3>
+                  <ul className="mt-3 list-disc space-y-2 pl-4 text-xs leading-5 text-slate-400">
+                    <li>Claude Code：同一回复的多行记录按 message.id + requestId 去重，跨文件（含子代理）只算一次。</li>
+                    <li>Codex：只统计 token_count 事件；累计值没变的重复事件跳过；子代理和 fork 开头继承的父线程历史不计入。</li>
+                    <li>Codex 的 input 已包含缓存，output 已包含推理，这里拆成四段互不重叠后分别计价。</li>
+                    <li>与 ccusage 等工具对比时，以“总 Tokens”和四段拆分为准；差异通常来自是否去重、是否计入缓存读取。</li>
+                  </ul>
+                </section>
               </div>
-
-              <div className="mt-5 rounded-2xl border border-cyan-400/20 bg-cyan-400/8 px-4 py-4 text-xs leading-6 text-cyan-100">
-                自动识别依赖本地启动脚本提供的只读 localhost 服务。估算费用、RPM、TPM 都是本地推导值，不是官方账单。
+            ) : null}
+          </>
+        ) : (
+          <section className="rounded-2xl border border-dashed border-white/10 bg-[#10131a] px-6 py-12 text-center">
+            <div className="mx-auto flex max-w-xl flex-col items-center">
+              <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#2a78d6]/15 text-[#86b6ef]">
+                <Database size={24} />
               </div>
-            </section>
-
-            <section className="rounded-2xl border border-white/8 bg-[#11141b] px-5 py-5 shadow-[0_24px_60px_rgba(0,0,0,0.28)]">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#f59e0b]/15 text-[#f7b84c]">
-                  <Wrench size={18} />
-                </div>
-                <div>
-                  <h2 className="text-sm font-semibold text-white">价格表设置</h2>
-                  <p className="mt-1 text-xs text-slate-400">按每百万 tokens 估算，修改后立即重算。Claude 缓存价格默认按 cache read / hit 近似估算。</p>
-                </div>
-              </div>
-
-              {unmatchedModels.length > 0 ? (
-                <div className="mt-5 rounded-2xl border border-amber-400/20 bg-amber-400/8 px-4 py-4 text-xs leading-6 text-amber-100">
-                  <p className="font-medium text-amber-50">以下模型当前没有命中任何价格规则：</p>
-                  <p className="mt-2 break-words">{unmatchedModels.join('、')}</p>
-                </div>
-              ) : (
-                <div className="mt-5 rounded-2xl border border-emerald-400/20 bg-emerald-400/8 px-4 py-4 text-xs leading-6 text-emerald-100">
-                  当前数据中的模型都已命中默认价格表或你的自定义规则。
-                </div>
-              )}
-
-              <div className="mt-5 space-y-4">
-                {priceRules.map((rule, index) => (
-                  <div key={`${rule.model}-${index}`} className="rounded-2xl border border-white/8 bg-white/[0.02] p-4">
-                    <label className="flex flex-col gap-2 text-xs text-slate-400">
-                      模型匹配
-                      <input value={rule.model} onChange={(event) => setPriceRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, model: event.target.value } : item))} className="rounded-xl border border-white/10 bg-[#0d1016] px-3 py-2 text-sm text-white outline-none" />
-                    </label>
-                    <div className="mt-3 grid gap-3 md:grid-cols-3 2xl:grid-cols-1">
-                      {[
-                        ['输入', 'inputPerMillion'],
-                        ['缓存输入', 'cachedInputPerMillion'],
-                        ['输出', 'outputPerMillion'],
-                      ].map(([label, key]) => (
-                        <label key={key} className="flex flex-col gap-2 text-xs text-slate-400">
-                          {label}
-                          <input type="number" min="0" step="0.001" value={rule[key as keyof PriceRule] as number} onChange={(event) => setPriceRules((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, [key]: Number(event.target.value || 0) } : item))} className="rounded-xl border border-white/10 bg-[#0d1016] px-3 py-2 text-sm text-white outline-none" />
-                        </label>
-                      ))}
-                    </div>
-                    <div className="mt-3 flex justify-end">
-                      <button type="button" onClick={() => setPriceRules((current) => current.length === 1 ? current : current.filter((_, itemIndex) => itemIndex !== index))} className="text-xs text-rose-300 transition hover:text-rose-200">
-                        删除此规则
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
-
-            <section className="rounded-2xl border border-white/8 bg-[#11141b] px-5 py-5 shadow-[0_24px_60px_rgba(0,0,0,0.28)]">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#8b5cf6]/15 text-[#baa3ff]">
-                  <Gauge size={18} />
-                </div>
-                <div>
-                  <h2 className="text-sm font-semibold text-white">关键摘要</h2>
-                  <p className="mt-1 text-xs text-slate-400">定位高消耗模型、项目与会话。</p>
-                </div>
-              </div>
-
-              {snapshot ? (
-                <div className="mt-5 space-y-4 text-sm">
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">峰值日期</span>
-                    <span className="text-right text-slate-200">{snapshot.peakDay ? `${snapshot.peakDay.label} / ${formatCompact(snapshot.peakDay.totalTokens, 2)}` : '-'}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">峰值小时</span>
-                    <span className="text-right text-slate-200">{snapshot.peakHour ? `${snapshot.peakHour.label} / ${formatCompact(snapshot.peakHour.totalTokens, 2)}` : '-'}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">平均会话 Tokens</span>
-                    <span className="text-slate-200">{formatCompact(snapshot.avgSessionTokens, 2)}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">平均工具调用</span>
-                    <span className="text-slate-200">{formatNumber(snapshot.avgToolCalls, 2)}</span>
-                  </div>
-                  <div className="border-t border-white/8 pt-4">
-                    <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Top Session</p>
-                    {snapshot.topSessions[0] ? (
-                      <div className="mt-3">
-                        <p className="font-medium text-white">{trimText(snapshot.topSessions[0].title, 42)}</p>
-                        <p className="mt-1 text-xs text-slate-500">{snapshot.topSessions[0].model}</p>
-                        <p className="mt-2 text-sm text-slate-300">{formatCompact(snapshot.topSessions[0].resolvedTotalTokens, 2)} tokens</p>
-                      </div>
-                    ) : (
-                      <p className="mt-3 text-sm text-slate-500">暂无数据</p>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                <p className="mt-5 text-sm text-slate-500">载入数据后显示。</p>
-              )}
-
-              <div className="mt-6 flex flex-wrap gap-3">
-                <button type="button" onClick={handleClearCache} className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10">
-                  清空缓存
+              <h2 className="mt-5 text-xl font-semibold text-white">还没有加载 {providerLabel.name} 数据</h2>
+              <p className="mt-3 text-sm leading-6 text-slate-400">
+                点“自动识别”读取本机 <code className="rounded bg-white/8 px-1.5 py-0.5 text-slate-200">{providerLabel.home}</code>（{providerLabel.files}）。
+                不是用 <code className="rounded bg-white/8 px-1.5 py-0.5 text-slate-200">npm run start:local</code> 启动时，请在“手动选择”里授权目录。
+              </p>
+              <div className="mt-6 flex flex-wrap justify-center gap-3">
+                <button type="button" onClick={handleAutoDetect} disabled={!localApiAvailable} className="rounded-full bg-[#2a78d6] px-5 py-2.5 text-sm font-medium text-white hover:bg-[#3987e5] disabled:opacity-50">
+                  自动识别
                 </button>
-                <a href="https://github.com/lizhiwei" target="_blank" rel="noreferrer" className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10">
-                  作者 lizhiwei
-                </a>
+                <button type="button" onClick={handleChooseDirectory} className={ghostButton}>授权目录</button>
+                <button type="button" onClick={() => fileInputRef.current?.click()} className={ghostButton}>选择文件夹</button>
               </div>
-            </section>
-          </aside>
-        </section>
+            </div>
+          </section>
+        )}
       </div>
       <SessionDetailDrawer session={selectedSession} onClose={() => setSelectedSession(null)} />
     </div>

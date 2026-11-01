@@ -6,12 +6,34 @@ export type TimeRangeKey = 'today' | '7d' | '30d' | 'custom' | 'all'
 
 export type ArchivedFilter = 'all' | 'active' | 'archived'
 
+/**
+ * Normalized usage, identical semantics for every provider:
+ * - inputTokens: uncached input only (billed at full input price)
+ * - cachedInputTokens: cache reads (billed at cache-read price)
+ * - cacheWriteTokens: cache creation / writes (billed at cache-write price)
+ * - outputTokens: all output, reasoning included
+ * - reasoningOutputTokens: informational subset of outputTokens
+ * - totalTokens: input + cached + cacheWrite + output
+ */
 export interface TokenUsage {
   inputTokens: number
   cachedInputTokens: number
+  cacheWriteTokens: number
+  cacheWrite1hTokens: number
   outputTokens: number
   reasoningOutputTokens: number
   totalTokens: number
+}
+
+export interface QualityStats {
+  rawUsageRecords: number
+  countedUsageRecords: number
+  duplicateRecords: number
+  duplicateTokens: number
+  invariantViolations: number
+  compressedFiles: number
+  /** Tokens known only as a session total (no input/output breakdown, cannot be priced). */
+  totalOnlyTokens: number
 }
 
 export interface ThreadSummary {
@@ -37,12 +59,12 @@ export interface ThreadSummary {
   threadSource: string
 }
 
-export interface TokenSample {
+export interface TokenSample extends TokenUsage {
   timestampMs: number
-  totalTokens: number
-  inputTokens: number
-  cachedInputTokens: number
-  outputTokens: number
+  /** Request context size (input + cache read + cache write) used for tiered pricing. */
+  contextTokens: number
+  /** Per-request model; falls back to the session model when empty. */
+  model?: string
 }
 
 export interface RequestSample {
@@ -76,6 +98,9 @@ export interface SessionEventSummary {
   requestSamples: RequestSample[]
   malformedLines: number
   eventCount: number
+  quality: QualityStats
+  forkedFromId: string
+  isSubagent: boolean
 }
 
 export interface MergedSession {
@@ -97,6 +122,9 @@ export interface MergedSession {
   usage: TokenUsage
   threadTokensUsed: number
   resolvedTotalTokens: number
+  rangeUsage?: TokenUsage
+  rangeTotalTokens?: number
+  rangeCost?: number
   userMessageCount: number
   assistantMessageCount: number
   interactionTurns: number
@@ -108,6 +136,8 @@ export interface MergedSession {
   eventCount: number
   durationMs: number
   usageConflict: boolean
+  quality: QualityStats
+  isSubagent: boolean
 }
 
 export interface SourceSummary {
@@ -128,11 +158,33 @@ export interface DashboardData {
   sourceSummary: SourceSummary
 }
 
+export interface PriceTier {
+  /** Applies when request context exceeds this many tokens. */
+  thresholdTokens: number
+  inputPerMillion: number
+  cachedInputPerMillion: number
+  cacheWritePerMillion: number
+  outputPerMillion: number
+}
+
 export interface PriceRule {
   model: string
   inputPerMillion: number
   cachedInputPerMillion: number
+  cacheWritePerMillion: number
+  cacheWrite1hPerMillion?: number
   outputPerMillion: number
+  tier?: PriceTier
+  source?: 'builtin' | 'litellm' | 'models.dev' | 'custom'
+}
+
+export interface PricingCatalog {
+  version: 2
+  updatedAtMs: number
+  source: string
+  rules: PriceRule[]
+  /** Model names the user edited by hand; never overwritten by sync. */
+  overrides: PriceRule[]
 }
 
 export interface FilterState {
@@ -154,6 +206,7 @@ export interface TrendPoint {
   inputTokens: number
   outputTokens: number
   cachedInputTokens: number
+  cacheWriteTokens: number
   sessionCount: number
   toolCallCount: number
   estimatedCost: number
@@ -197,8 +250,15 @@ export interface MetricSnapshot {
   totalTokens: number
   inputTokens: number
   cachedInputTokens: number
+  cacheWriteTokens: number
   outputTokens: number
+  reasoningOutputTokens: number
   estimatedCost: number
+  costBreakdown: CostBreakdown
+  unpricedTokens: number
+  unpricedModels: string[]
+  tieredRequests: number
+  quality: QualityStats
   sessionCount: number
   interactionTurns: number
   userMessages: number
@@ -226,7 +286,21 @@ export interface MetricSnapshot {
   sparklineTpm: number[]
 }
 
+export interface CostBreakdown {
+  input: number
+  cachedInput: number
+  cacheWrite: number
+  output: number
+}
+
+export interface DailyBucket {
+  day: string
+  totalTokens: number
+  estimatedCost: number
+}
+
 export interface CacheRecord {
+  schemaVersion?: number
   savedAtMs: number
   dataset: DashboardData
 }

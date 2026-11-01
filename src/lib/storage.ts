@@ -1,6 +1,9 @@
 import { deleteDB, openDB } from 'idb'
 import type { DBSchema, IDBPDatabase } from 'idb'
-import type { CacheRecord, DashboardData, PriceRule, ProviderType } from '../types'
+import type { CacheRecord, DashboardData, PricingCatalog, ProviderType } from '../types'
+
+/** 解析规则变化时递增，旧缓存会被丢弃并重新解析。 */
+export const CACHE_SCHEMA_VERSION = 3
 
 interface CodexDashboardDB extends DBSchema {
   handles: {
@@ -13,7 +16,7 @@ interface CodexDashboardDB extends DBSchema {
   }
   settings: {
     key: string
-    value: PriceRule[]
+    value: unknown
   }
 }
 
@@ -51,6 +54,7 @@ export async function saveCache(dataset: DashboardData, provider: ProviderType) 
   await db.put(
     'cache',
     {
+      schemaVersion: CACHE_SCHEMA_VERSION,
       savedAtMs: Date.now(),
       dataset,
     },
@@ -60,17 +64,19 @@ export async function saveCache(dataset: DashboardData, provider: ProviderType) 
 
 export async function loadCache(provider: ProviderType) {
   const db = await getDb()
-  return db.get('cache', providerKey(provider, 'latest'))
+  const record = await db.get('cache', providerKey(provider, 'latest'))
+  return record?.schemaVersion === CACHE_SCHEMA_VERSION ? record : undefined
 }
 
-export async function savePriceRules(priceRules: PriceRule[]) {
+export async function savePricingCatalog(catalog: PricingCatalog) {
   const db = await getDb()
-  await db.put('settings', priceRules, 'price-rules')
+  await db.put('settings', catalog, 'pricing-catalog')
 }
 
-export async function loadPriceRules() {
+export async function loadPricingCatalog() {
   const db = await getDb()
-  return db.get('settings', 'price-rules')
+  const value = (await db.get('settings', 'pricing-catalog')) as PricingCatalog | undefined
+  return value?.version === 2 && Array.isArray(value.rules) ? value : undefined
 }
 
 export async function clearStoredState() {

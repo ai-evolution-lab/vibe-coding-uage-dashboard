@@ -11,7 +11,11 @@ import type {
   VirtualFileEntry,
   ProviderType,
 } from '../types'
+import { decompress as decompressZstd } from 'fzstd'
 import { asPermissionHandle } from './filesystem'
+import { addUsage, asNumber, createEmptyQuality, createEmptyUsage, sumUsageParts } from './usage'
+
+export { createEmptyUsage } from './usage'
 
 let sqlPromise: Promise<Awaited<ReturnType<typeof initSqlJs>>> | null = null
 
@@ -24,28 +28,57 @@ async function getSql() {
   return sqlPromise
 }
 
-function asNumber(value: unknown) {
-  return typeof value === 'number' ? value : Number(value ?? 0)
-}
-
-function normalizeTokenUsage(raw: Record<string, unknown> | undefined | null): TokenUsage {
-  return {
-    inputTokens: asNumber(raw?.input_tokens),
-    cachedInputTokens: asNumber(raw?.cached_input_tokens),
+/**
+ * Codex token_count 语义（与 ccusage 一致）：
+ * - input_tokens 包含 cached_input_tokens 和 cache_write_input_tokens
+ * - output_tokens 包含 reasoning_output_tokens
+ * 这里拆成互不重叠的四段，便于分别计价。
+ */
+export function normalizeCodexUsage(raw: Record<string, unknown> | undefined | null): TokenUsage {
+  const input = asNumber(raw?.input_tokens)
+  const cached = Math.min(input, asNumber(raw?.cached_input_tokens))
+  const cacheWrite = Math.min(input - cached, asNumber(raw?.cache_write_input_tokens))
+  const usage: TokenUsage = {
+    inputTokens: input - cached - cacheWrite,
+    cachedInputTokens: cached,
+    cacheWriteTokens: cacheWrite,
+    cacheWrite1hTokens: 0,
     outputTokens: asNumber(raw?.output_tokens),
     reasoningOutputTokens: asNumber(raw?.reasoning_output_tokens),
-    totalTokens: asNumber(raw?.total_tokens),
-  }
-}
-
-export function createEmptyUsage(): TokenUsage {
-  return {
-    inputTokens: 0,
-    cachedInputTokens: 0,
-    outputTokens: 0,
-    reasoningOutputTokens: 0,
     totalTokens: 0,
   }
+  usage.totalTokens = sumUsageParts(usage)
+  return usage
+}
+
+export function isCodexSessionPath(path: string) {
+  return path.startsWith('sessions/') && (path.endsWith('.jsonl') || path.endsWith('.jsonl.zst'))
+}
+
+/** 读取会话文件文本，.jsonl.zst 在浏览器内解压。 */
+export async function readCodexSessionText(file: Blob, path: string) {
+  if (!path.endsWith('.zst')) {
+    return file.text()
+  }
+  const bytes = decompressZstd(new Uint8Array(await file.arrayBuffer()))
+  return new TextDecoder().decode(bytes)
+}
+
+// 这些行体积大且与计量无关，先用行首判断跳过，避免 JSON.parse。
+const SKIPPED_PAYLOAD_TYPES = [
+  '"type":"function_call_output"',
+  '"type":"custom_tool_call_output"',
+  '"type":"item_completed"',
+  '"type":"reasoning"',
+  '"type":"image_generation_call"',
+  '"type":"compacted"',
+  '"type":"world_state"',
+  '"type":"exec_command_output_delta"',
+]
+
+function shouldSkipLine(line: string) {
+  const head = line.slice(0, 200)
+  return SKIPPED_PAYLOAD_TYPES.some((marker) => head.includes(marker))
 }
 
 export function getString(value: unknown) {
@@ -159,8 +192,18 @@ export function takeTextFromMessageContent(content: unknown): string {
   return parts.join('\n').trim()
 }
 
-export function summarizeCodexSessionJsonl(text: string, sessionFilePath: string): SessionEventSummary | null {
-  const lines = text.split('\n')
+/**
+ * 解析一个 Codex 会话文件。
+ * 计量规则：
+ * 1. 只看 event_msg / token_count；累计值 total_token_usage 与上一条相同的重复事件跳过。
+ * 2. 增量优先用 last_token_usage，缺失时用累计值相减。
+ * 3. 子代理 / fork 文件第一条 token_count 带着父线程的累计值且 last=0，
+ *    这部分是父线程的历史，只作为基线，不计入。
+ */
+export function summarizeCodexSessionJsonl(
+  text: string,
+  sessionFilePath: string,
+): SessionEventSummary | null {
   let metaId = ''
   let metaTimestampMs = 0
   let cwd = ''
@@ -179,20 +222,37 @@ export function summarizeCodexSessionJsonl(text: string, sessionFilePath: string
   let toolCallCount = 0
   let malformedLines = 0
   let eventCount = 0
-  let lastTokenUsage: TokenUsage | null = null
+  let forkedFromId = ''
+  let isSubagent = false
+  let previousTotalKey = ''
+  let previousTotal: TokenUsage | null = null
+  const usage = createEmptyUsage()
+  const quality = createEmptyQuality()
+  if (sessionFilePath.endsWith('.zst')) {
+    quality.compressedFiles = 1
+  }
   const toolBreakdown: Record<string, number> = {}
   const tokenSamples: TokenSample[] = []
   const requestSamples: SessionEventSummary['requestSamples'] = []
 
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (!trimmed) {
+  let lineStart = 0
+  while (lineStart < text.length) {
+    let lineEnd = text.indexOf('\n', lineStart)
+    if (lineEnd === -1) {
+      lineEnd = text.length
+    }
+    const line = text.slice(lineStart, lineEnd).trim()
+    lineStart = lineEnd + 1
+    if (!line) {
       continue
     }
     eventCount += 1
+    if (shouldSkipLine(line)) {
+      continue
+    }
     let parsed: Record<string, unknown>
     try {
-      parsed = JSON.parse(trimmed) as Record<string, unknown>
+      parsed = JSON.parse(line) as Record<string, unknown>
     } catch {
       malformedLines += 1
       continue
@@ -215,13 +275,20 @@ export function summarizeCodexSessionJsonl(text: string, sessionFilePath: string
         : null
 
     if (type === 'session_meta' && payload) {
+      if (metaId) {
+        continue
+      }
       metaId = getString(payload.id)
       metaTimestampMs = parseEventTimestamp(payload.timestamp)
       cwd = getString(payload.cwd)
-      source = getString(payload.source)
+      const rawSource = payload.source
+      source = typeof rawSource === 'string' ? rawSource : rawSource ? JSON.stringify(rawSource) : ''
+      isSubagent = Boolean(rawSource && typeof rawSource === 'object' && 'subagent' in rawSource)
       threadSource = getString(payload.thread_source)
       modelProvider = getString(payload.model_provider)
       cliVersion = getString(payload.cli_version)
+      const historyBase = payload.history_base as Record<string, unknown> | undefined
+      forkedFromId = getString(payload.forked_from_id) || getString(historyBase?.thread_id)
       continue
     }
 
@@ -253,13 +320,12 @@ export function summarizeCodexSessionJsonl(text: string, sessionFilePath: string
         }
       }
 
-      if (payloadType === 'function_call') {
+      if (payloadType === 'function_call' || payloadType === 'custom_tool_call') {
         toolCallCount += 1
         const toolName = getString(payload.name) || 'unknown'
         toolBreakdown[toolName] = (toolBreakdown[toolName] ?? 0) + 1
         requestSamples.push({ timestampMs, kind: 'tool', toolName })
       }
-
       continue
     }
 
@@ -270,24 +336,53 @@ export function summarizeCodexSessionJsonl(text: string, sessionFilePath: string
           payload.info && typeof payload.info === 'object'
             ? (payload.info as Record<string, unknown>)
             : null
-        const totalUsage =
-          info?.total_token_usage && typeof info.total_token_usage === 'object'
-            ? (info.total_token_usage as Record<string, unknown>)
-            : null
-        const lastUsage =
-          info?.last_token_usage && typeof info.last_token_usage === 'object'
-            ? (info.last_token_usage as Record<string, unknown>)
-            : null
-        lastTokenUsage = normalizeTokenUsage(totalUsage ?? lastUsage)
+        const rawTotal = info?.total_token_usage as Record<string, unknown> | undefined
+        const rawLast = info?.last_token_usage as Record<string, unknown> | undefined
+        if (!rawTotal && !rawLast) {
+          continue
+        }
+        quality.rawUsageRecords += 1
+        const totalKey = rawTotal ? JSON.stringify(rawTotal) : ''
+        const last = rawLast ? normalizeCodexUsage(rawLast) : null
+        if (totalKey && totalKey === previousTotalKey) {
+          quality.duplicateRecords += 1
+          quality.duplicateTokens += last?.totalTokens ?? 0
+          continue
+        }
+        const total = rawTotal ? normalizeCodexUsage(rawTotal) : null
+        let sample: TokenUsage | null = last && last.totalTokens > 0 ? last : null
+        // 只有累计值、没有本轮增量时才相减。文件里第一条累计值若带着 last=0，
+        // 说明是从父线程继承的历史（子代理 / fork），只作为基线，不计入。
+        if (!sample && total && !rawLast) {
+          sample = previousTotal ? subtractUsage(total, previousTotal) : total
+        }
+        if (!sample && total && !previousTotal && total.totalTokens > 0) {
+          quality.duplicateRecords += 1
+          quality.duplicateTokens += total.totalTokens
+        }
+        previousTotalKey = totalKey || previousTotalKey
+        previousTotal = total ?? previousTotal
+
+        if (rawLast) {
+          const rawInput = asNumber(rawLast.input_tokens)
+          if (
+            asNumber(rawLast.cached_input_tokens) + asNumber(rawLast.cache_write_input_tokens) > rawInput ||
+            asNumber(rawLast.reasoning_output_tokens) > asNumber(rawLast.output_tokens)
+          ) {
+            quality.invariantViolations += 1
+          }
+        }
+        if (!sample || sample.totalTokens <= 0) {
+          continue
+        }
+        quality.countedUsageRecords += 1
+        addUsage(usage, sample)
         if (timestampMs > 0) {
           tokenSamples.push({
+            ...sample,
             timestampMs,
-            totalTokens: asNumber(lastUsage?.total_tokens ?? totalUsage?.total_tokens),
-            inputTokens: asNumber(lastUsage?.input_tokens ?? totalUsage?.input_tokens),
-            cachedInputTokens: asNumber(
-              lastUsage?.cached_input_tokens ?? totalUsage?.cached_input_tokens,
-            ),
-            outputTokens: asNumber(lastUsage?.output_tokens ?? totalUsage?.output_tokens),
+            contextTokens: sample.inputTokens + sample.cachedInputTokens + sample.cacheWriteTokens,
+            model,
           })
         }
       } else if (payloadType === 'agent_message') {
@@ -299,7 +394,19 @@ export function summarizeCodexSessionJsonl(text: string, sessionFilePath: string
     }
   }
 
-  const id = metaId || sessionFilePath.split('/').pop()?.replace('.jsonl', '') || sessionFilePath
+  // turn_context 之前的 token_count 还不知道模型，用会话里第一次出现的模型补上。
+  const firstModel = tokenSamples.find((sample) => sample.model)?.model || model
+  for (const sample of tokenSamples) {
+    if (!sample.model) {
+      sample.model = firstModel
+    }
+  }
+
+  const fileName = sessionFilePath.split('/').pop() ?? sessionFilePath
+  const fileId = fileName.replace(/\.jsonl(\.zst)?$/, '')
+  // fork 出来的文件会复用父线程的 session_meta.id，用文件名里的线程 id 区分。
+  const fileThreadId = /_([0-9a-f-]{36})$/.exec(fileId)?.[1] ?? ''
+  const id = fileThreadId || metaId || fileId
   if (!id) {
     return null
   }
@@ -324,30 +431,60 @@ export function summarizeCodexSessionJsonl(text: string, sessionFilePath: string
     toolCallCount,
     interactionTurns: Math.max(userMessageCount, assistantMessageCount),
     toolBreakdown,
-    lastTokenUsage,
+    lastTokenUsage: usage,
     tokenSamples,
     requestSamples,
     malformedLines,
     eventCount,
+    quality,
+    forkedFromId: fileThreadId && metaId !== fileThreadId ? metaId : forkedFromId,
+    isSubagent,
   }
+}
+
+function subtractUsage(current: TokenUsage, previous: TokenUsage): TokenUsage {
+  const next: TokenUsage = {
+    inputTokens: Math.max(0, current.inputTokens - previous.inputTokens),
+    cachedInputTokens: Math.max(0, current.cachedInputTokens - previous.cachedInputTokens),
+    cacheWriteTokens: Math.max(0, current.cacheWriteTokens - previous.cacheWriteTokens),
+    cacheWrite1hTokens: 0,
+    outputTokens: Math.max(0, current.outputTokens - previous.outputTokens),
+    reasoningOutputTokens: Math.max(0, current.reasoningOutputTokens - previous.reasoningOutputTokens),
+    totalTokens: 0,
+  }
+  next.totalTokens = sumUsageParts(next)
+  return next
+}
+
+/** sqlite 里是绝对路径且不带 .zst，统一成 sessions/... 相对路径再匹配。 */
+function normalizeRolloutKey(path: string) {
+  const index = path.lastIndexOf('/sessions/')
+  const relative = index >= 0 ? path.slice(index + 1) : path
+  return relative.replace(/\.zst$/, '')
 }
 
 export function mergeCodexThreadsAndSessions(threads: ThreadSummary[], sessions: SessionEventSummary[]) {
   const threadById = new Map(threads.map((thread) => [thread.id, thread]))
   const threadByRolloutPath = new Map(
-    threads.filter((thread) => thread.rolloutPath).map((thread) => [thread.rolloutPath, thread]),
+    threads.filter((thread) => thread.rolloutPath).map((thread) => [normalizeRolloutKey(thread.rolloutPath), thread]),
   )
   const merged = new Map<string, MergedSession>()
+  const matchedThreadIds = new Set<string>()
 
   for (const session of sessions) {
     const thread =
-      threadById.get(session.id) ??
-      threadByRolloutPath.get(session.sessionFilePath.replace('/sessions/', '/')) ??
-      threadByRolloutPath.get(session.sessionFilePath)
+      threadByRolloutPath.get(normalizeRolloutKey(session.sessionFilePath)) ?? threadById.get(session.id)
+    if (thread) {
+      matchedThreadIds.add(thread.id)
+    }
 
     const usage = session.lastTokenUsage ?? createEmptyUsage()
     const threadTokensUsed = thread?.tokensUsed ?? 0
     const resolvedTotalTokens = usage.totalTokens > 0 ? usage.totalTokens : threadTokensUsed
+    const quality = { ...session.quality }
+    if (usage.totalTokens === 0 && threadTokensUsed > 0) {
+      quality.totalOnlyTokens += threadTokensUsed
+    }
     const createdAtMs =
       thread?.createdAtMs || session.sessionTimestampMs || session.firstEventAtMs || session.lastEventAtMs
     const updatedAtMs = thread?.updatedAtMs || session.lastEventAtMs || createdAtMs
@@ -385,14 +522,22 @@ export function mergeCodexThreadsAndSessions(threads: ThreadSummary[], sessions:
       malformedLines: session.malformedLines,
       eventCount: session.eventCount,
       durationMs,
-      usageConflict: usage.totalTokens > 0 && threadTokensUsed > 0 && usage.totalTokens !== threadTokensUsed,
+      // sqlite 的 tokens_used 包含 fork/子代理继承的父线程历史，差异超过 5% 才标记。
+      usageConflict:
+        usage.totalTokens > 0 &&
+        threadTokensUsed > 0 &&
+        Math.abs(usage.totalTokens - threadTokensUsed) / Math.max(usage.totalTokens, threadTokensUsed) > 0.05,
+      quality,
+      isSubagent: session.isSubagent,
     })
   }
 
   for (const thread of threads) {
-    if (merged.has(thread.id)) {
+    if (matchedThreadIds.has(thread.id) || merged.has(thread.id)) {
       continue
     }
+    const quality = createEmptyQuality()
+    quality.totalOnlyTokens = thread.tokensUsed
 
     merged.set(thread.id, {
       id: thread.id,
@@ -424,6 +569,8 @@ export function mergeCodexThreadsAndSessions(threads: ThreadSummary[], sessions:
       eventCount: 0,
       durationMs: Math.max(0, thread.updatedAtMs - thread.createdAtMs),
       usageConflict: false,
+      quality,
+      isSubagent: thread.source.includes('subagent'),
     })
   }
 
@@ -473,7 +620,7 @@ async function listFilesFromHandle(
       await listFilesFromHandle(entry, nextPath, entries)
       continue
     }
-    if (nextPath === 'state_5.sqlite' || (nextPath.startsWith('sessions/') && nextPath.endsWith('.jsonl'))) {
+    if (nextPath === 'state_5.sqlite' || isCodexSessionPath(nextPath)) {
       entries.push({
         path: nextPath,
         file: await entry.getFile(),
@@ -499,8 +646,7 @@ export async function readEntriesFromFileList(fileList: FileList) {
         : relativePath
 
     if (
-      normalizedPath === 'state_5.sqlite' ||
-      (normalizedPath.startsWith('sessions/') && normalizedPath.endsWith('.jsonl'))
+      normalizedPath === 'state_5.sqlite' || isCodexSessionPath(normalizedPath)
     ) {
       entries.push({ path: normalizedPath, file })
     }
@@ -526,18 +672,18 @@ export async function parseCodexEntries(
     throw new Error('没有找到 state_5.sqlite，请确认选择的是完整的 .codex 目录。')
   }
 
-  const sessionFiles = entries.filter((entry) => entry.path.startsWith('sessions/') && entry.path.endsWith('.jsonl'))
+  const sessionFiles = entries.filter((entry) => isCodexSessionPath(entry.path))
   const threads = await parseCodexThreadFile(stateFile.file)
   const sessions: SessionEventSummary[] = []
 
   for (const [index, entry] of sessionFiles.entries()) {
     onProgress?.({
-      phase: '正在解析 sessions jsonl',
+      phase: '正在解析 Codex 会话',
       processed: index + 1,
       total: sessionFiles.length,
     })
 
-    const text = await entry.file.text()
+    const text = await readCodexSessionText(entry.file, entry.path)
     const summary = summarizeCodexSessionJsonl(text, entry.path)
     if (summary) {
       sessions.push(summary)

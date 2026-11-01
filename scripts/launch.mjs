@@ -110,11 +110,12 @@ async function inspectProvider(provider) {
     }
     return (
       relativePath === 'state_5.sqlite' ||
-      (relativePath.startsWith('sessions/') && relativePath.endsWith('.jsonl'))
+      (relativePath.startsWith('sessions/') &&
+        (relativePath.endsWith('.jsonl') || relativePath.endsWith('.jsonl.zst')))
     )
   })
 
-  const sessionFileCount = files.filter((file) => file.path.endsWith('.jsonl')).length
+  const sessionFileCount = files.filter((file) => /\.jsonl(\.zst)?$/.test(file.path)).length
   const hasRequiredRoot = provider === 'claude' ? sessionFileCount > 0 : files.some((file) => file.path === 'state_5.sqlite')
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
 

@@ -1,7 +1,7 @@
 import { FolderOpen, Search, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import type { MergedSession } from '../types'
-import { compactPath, formatCompact, formatDateTime, formatDuration, trimText } from '../lib/format'
+import { compactPath, formatCompact, formatCurrency, formatDateTime, formatDuration, trimText } from '../lib/format'
 
 interface SessionTableProps {
   sessions: MergedSession[]
@@ -12,10 +12,14 @@ interface SessionTableProps {
   onClearProject?: () => void
 }
 
-type SortKey = 'updatedAtMs' | 'resolvedTotalTokens' | 'toolCallCount' | 'durationMs'
+type SortKey = 'updatedAtMs' | 'resolvedTotalTokens' | 'rangeCost' | 'toolCallCount' | 'durationMs'
 
 function getProjectLeaf(path: string) {
   return path.split(/[\\/]/).filter(Boolean).pop() || path || '-'
+}
+
+function getDisplayTokens(session: MergedSession) {
+  return session.rangeTotalTokens ?? session.resolvedTotalTokens
 }
 
 export function SessionTable({
@@ -36,7 +40,9 @@ export function SessionTable({
     const next = [...sessions]
     next.sort((left, right) => {
       const multiplier = sortDirection === 'desc' ? -1 : 1
-      return left[sortKey] > right[sortKey] ? multiplier : left[sortKey] < right[sortKey] ? -multiplier : 0
+      const leftValue = sortKey === 'resolvedTotalTokens' ? getDisplayTokens(left) : (left[sortKey] ?? 0)
+      const rightValue = sortKey === 'resolvedTotalTokens' ? getDisplayTokens(right) : (right[sortKey] ?? 0)
+      return leftValue > rightValue ? multiplier : leftValue < rightValue ? -multiplier : 0
     })
     return next
   }, [sessions, sortDirection, sortKey])
@@ -119,6 +125,11 @@ export function SessionTable({
                 </button>
               </th>
               <th className="px-5 py-3 font-medium">
+                <button type="button" onClick={() => changeSort('rangeCost')} className="cursor-pointer">
+                  费用
+                </button>
+              </th>
+              <th className="px-5 py-3 font-medium">
                 <button type="button" onClick={() => changeSort('toolCallCount')} className="cursor-pointer">
                   工具调用
                 </button>
@@ -144,21 +155,25 @@ export function SessionTable({
                     <p className="mt-2 text-[11px] text-slate-600">{session.id}</p>
                   </div>
                 </td>
-                <td className="px-5 py-4 align-top text-slate-300">{session.model}</td>
+                <td className="px-5 py-4 align-top text-slate-300">
+                  {session.model}
+                  {session.isSubagent ? <span className="ml-1.5 rounded bg-white/6 px-1.5 py-0.5 text-[11px] text-slate-400">子代理</span> : null}
+                </td>
                 <td className="px-5 py-4 align-top text-slate-400" title={session.cwd || '-'}>
                   <div className="max-w-[360px] text-xs leading-5 text-slate-400">
                     {compactPath(session.cwd || '-', 72)}
                   </div>
                 </td>
                 <td className="px-5 py-4 align-top text-slate-300">{formatDateTime(session.updatedAtMs)}</td>
-                <td className="px-5 py-4 align-top text-white">{formatCompact(session.resolvedTotalTokens, 2)}</td>
+                <td className="px-5 py-4 align-top text-white">{formatCompact(getDisplayTokens(session), 2)}</td>
+                <td className="px-5 py-4 align-top text-slate-300">{formatCurrency(session.rangeCost ?? 0)}</td>
                 <td className="px-5 py-4 align-top text-slate-300">{session.toolCallCount}</td>
                 <td className="px-5 py-4 align-top text-slate-300">{formatDuration(session.durationMs)}</td>
               </tr>
             ))}
             {visible.length === 0 ? (
               <tr>
-                <td colSpan={7} className="px-5 py-10 text-center text-sm text-slate-500">
+                <td colSpan={8} className="px-5 py-10 text-center text-sm text-slate-500">
                   当前筛选条件下没有数据。
                 </td>
               </tr>
@@ -167,7 +182,7 @@ export function SessionTable({
         </table>
       </div>
       <footer className="flex items-center justify-between border-t border-white/8 px-5 py-4 text-xs text-slate-500">
-        <span>排序字段：{sortKey}</span>
+        <span>点击表头排序</span>
         <div className="flex items-center gap-2">
           <button
             type="button"
