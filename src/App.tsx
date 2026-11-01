@@ -81,6 +81,8 @@ const AUTO_UPDATE_KEY = 'vcud.pricing.autoUpdate'
 const DEFAULT_PROVIDER_KEY = 'vcud.defaultProvider'
 const AUTO_LOAD_KEY = 'vcud.autoLoad'
 const DEFAULT_RANGE_KEY = 'vcud.defaultRange'
+/** 数据超过这个时间才自动刷新（切换工具、页面一直挂着时） */
+const DATA_STALE_MS = 60 * 60 * 1000
 
 function readPreference(key: string) {
   try {
@@ -194,6 +196,9 @@ function getProjectLeaf(path: string) {
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sessionSectionRef = useRef<HTMLDivElement | null>(null)
+  const settingsRef = useRef<HTMLDetailsElement | null>(null)
+  const initialLoadDoneRef = useRef(false)
+  const lastAutoDetectAtRef = useRef(0)
   const [dataset, setDataset] = useState<DashboardData | null>(null)
   const [loading, setLoading] = useState(false)
   const [progress, setProgress] = useState<LoadProgress | null>(null)
@@ -222,6 +227,8 @@ function App() {
   const provider = filters.provider
   const providerLabel = providerLabels[provider]
   const localApiAvailable = hasLocalApi()
+  const providerRef = useRef(provider)
+  providerRef.current = provider
 
   useEffect(() => {
     let cancelled = false
@@ -281,14 +288,20 @@ function App() {
           return
         }
 
-        if (cacheRecord?.dataset) {
-          setDataset(cacheRecord.dataset)
+        const isInitialLoad = !initialLoadDoneRef.current
+        initialLoadDoneRef.current = true
+        const cached = cacheRecord?.dataset
+        if (cached) {
+          setDataset(cached)
           setLastLoadedFromCache(true)
         }
 
-        // 本地启动模式下，打开页面或切换工具时自动读取最新数据（先显示缓存，再后台刷新）。
-        if (localApiAvailable && autoLoad) {
-          await handleAutoDetect({ silent: Boolean(cacheRecord?.dataset), isCancelled: () => cancelled })
+        // 本地启动模式：打开页面时按设置读取最新数据；切换工具时有 1 小时内的缓存就直接用，不重新读取。
+        if (localApiAvailable) {
+          const stale = !cached || Date.now() - cached.sourceSummary.parsedAtMs > DATA_STALE_MS
+          if (!cached || (autoLoad && (isInitialLoad || stale))) {
+            await handleAutoDetect({ silent: Boolean(cached), isCancelled: () => cancelled })
+          }
           return
         }
 
@@ -318,6 +331,38 @@ function App() {
     // after transient loading state changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider])
+
+  // 页面一直开着时，数据满 1 小时后台自动刷新一次
+  const parsedAtMs = dataset?.sourceSummary.parsedAtMs
+  useEffect(() => {
+    if (!localApiAvailable || !autoLoad || loading || parsedAtMs === undefined) {
+      return
+    }
+    // 以上次成功解析和上次尝试中较晚的为准，读取失败时不会立刻反复重试
+    const delay = Math.max(0, Math.max(parsedAtMs, lastAutoDetectAtRef.current) + DATA_STALE_MS - Date.now())
+    const timer = window.setTimeout(() => void handleAutoDetect({ silent: true }), delay)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, autoLoad, loading, parsedAtMs, localApiAvailable])
+
+  // 点击设置面板外侧或按 Esc 时关闭面板（选项点击后已即时保存）
+  useEffect(() => {
+    function closeSettings(event: Event) {
+      const panel = settingsRef.current
+      if (!panel?.open) {
+        return
+      }
+      if (event instanceof KeyboardEvent ? event.key === 'Escape' : !panel.contains(event.target as Node)) {
+        panel.open = false
+      }
+    }
+    document.addEventListener('pointerdown', closeSettings)
+    document.addEventListener('keydown', closeSettings)
+    return () => {
+      document.removeEventListener('pointerdown', closeSettings)
+      document.removeEventListener('keydown', closeSettings)
+    }
+  }, [])
 
   useEffect(() => {
     if (catalogReady) {
@@ -438,13 +483,16 @@ function App() {
       return
     }
     const targetProvider = provider
+    lastAutoDetectAtRef.current = Date.now()
     setError('')
     setLoading(true)
     setSourceHandle(null)
     setProgress({ phase: `${options?.silent ? '后台刷新' : '正在自动识别'} ${providerLabel.home}`, processed: 0, total: 1 })
     try {
       const nextDataset = await loadLocalApiDataset(targetProvider, setProgress)
-      if (options?.isCancelled?.()) {
+      if (options?.isCancelled?.() || providerRef.current !== targetProvider) {
+        // 读取期间切换了工具：结果仍写入该工具的缓存，但不覆盖当前页面
+        await saveCache(nextDataset, targetProvider)
         return
       }
       setDataset(nextDataset)
@@ -452,7 +500,7 @@ function App() {
       setLastLoadedFromCache(false)
       await saveCache(nextDataset, targetProvider)
     } catch (detectError) {
-      if (options?.isCancelled?.()) {
+      if (options?.isCancelled?.() || providerRef.current !== targetProvider) {
         return
       }
       setError(
@@ -901,7 +949,7 @@ function App() {
                 <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
                 {loading ? '读取中…' : '刷新数据'}
               </button>
-              <details className="relative">
+              <details ref={settingsRef} className="relative">
                 <summary className="inline-flex cursor-pointer list-none items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-1.5 text-sm text-slate-200 transition hover:bg-white/10">
                   <Settings size={15} />
                   设置
@@ -937,7 +985,7 @@ function App() {
                     <input type="checkbox" className="mt-1" checked={autoLoad} onChange={(event) => changeAutoLoad(event.target.checked)} />
                     <span>
                       打开页面时自动读取最新数据
-                      <span className="block text-xs text-slate-500">先显示上次缓存，再在后台刷新；需要用本地启动脚本打开</span>
+                      <span className="block text-xs text-slate-500">先显示上次缓存，再在后台刷新；页面开着时每小时自动刷新一次。切换工具时直接用缓存。需要用本地启动脚本打开</span>
                     </span>
                   </label>
                   <label className="mt-3 flex items-start gap-2 text-slate-200">
@@ -969,7 +1017,7 @@ function App() {
           </div>
           <p className="mt-2 text-xs text-slate-500">
             读取本机 {providerLabel.home}，数据不上传；费用按公开价格估算，不是官方账单
-            {dataset ? ` · 解析于 ${formatDateTime(dataset.sourceSummary.parsedAtMs)}${lastLoadedFromCache ? '（缓存，正在刷新）' : ''}` : ''}
+            {dataset ? ` · 解析于 ${formatDateTime(dataset.sourceSummary.parsedAtMs)}${lastLoadedFromCache ? (loading ? '（缓存，正在刷新）' : '（缓存）') : ''}` : ''}
           </p>
         </header>
 
